@@ -6,3 +6,4 @@ cv2
 sklearn
 pandas
 opencv-python
+scikit-learn
