@@ -4,3 +4,5 @@ torch
 numpy
 cv2
 sklearn
+pandas
+opencv-python
