@@ -3,6 +3,121 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+
+class TransformerBlock(nn.Module):
+    """Standard transformer encoder block with LN → MHSA → MLP."""
+    def __init__(self, embed_dim, num_heads, mlp_ratio=4.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn  = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp   = nn.Sequential(
+            nn.Linear(embed_dim, int(embed_dim * mlp_ratio)),
+            nn.GELU(),
+            nn.Linear(int(embed_dim * mlp_ratio), embed_dim)
+        )
+
+    def forward(self, x):
+        # Multi-head self-attention
+        x_res = x
+        x = self.norm1(x)
+        attn_out, _ = self.attn(x, x, x)
+        x = x_res + attn_out
+
+        # MLP
+        x_res = x
+        x = self.norm2(x)
+        x = x_res + self.mlp(x)
+        return x
+
+
+class StackedHierarchicalTransformer(nn.Module):
+    """
+    Implements the EXACT hierarchy you required:
+
+    Block1: concat([feature_map_embed, st_encode])
+    Block2: concat([Block1_out, st_encode])
+    Block3: concat([Block2_out, Block1_out])
+    Block4: concat([Block3_out, Block2_out])
+    Block5: concat([Block4_out, Block3_out])
+    """
+
+    def __init__(self, embed_dim=256, num_heads=8, num_blocks=5):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.num_blocks = num_blocks
+
+        # Each block must expand to accept concatenated embeddings
+        # So we allow dynamic input dim
+        self.blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads)
+            for _ in range(num_blocks)
+        ])
+
+        # projections to match concatenation dims
+        self.proj_in = nn.Linear(embed_dim * 2, embed_dim)   # for Block1 & Block2
+        self.proj_mid = nn.Linear(embed_dim * 2, embed_dim)  # for Block3–5
+
+    def forward(self, feature_map_embed, st_embed):
+        """
+        feature_map_embed : (B, D)
+        st_embed          : (B, D)
+
+        Both become seq length 1: (B, 1, D)
+        """
+
+        B, D = st_embed.shape
+        f1 = feature_map_embed.unsqueeze(1)   # (B,1,D)
+        s1 = st_embed.unsqueeze(1)            # (B,1,D)
+
+        # ----------------------------------------------------
+        # BLOCK 1
+        # input_1 = concat([feature_map_embed , spatiotemporal_encoding])
+        # ----------------------------------------------------
+        inp1 = torch.cat([f1, s1], dim=-1)               # (B,1,2D)
+        inp1 = self.proj_in(inp1)                        # → (B,1,D)
+        out1 = self.blocks[0](inp1)                      # (B,1,D)
+
+        # ----------------------------------------------------
+        # BLOCK 2
+        # input_2 = concat([output_1 , spatiotemporal_encoding])
+        # ----------------------------------------------------
+        inp2 = torch.cat([out1, s1], dim=-1)             # (B,1,2D)
+        inp2 = self.proj_in(inp2)
+        out2 = self.blocks[1](inp2)                      # (B,1,D)
+
+        # ----------------------------------------------------
+        # BLOCK 3
+        # input_3 = concat([output_2 , output_1])
+        # ----------------------------------------------------
+        inp3 = torch.cat([out2, out1], dim=-1)
+        inp3 = self.proj_mid(inp3)
+        out3 = self.blocks[2](inp3)
+
+        # ----------------------------------------------------
+        # BLOCK 4
+        # input_4 = concat([output_3 , output_2])
+        # ----------------------------------------------------
+        inp4 = torch.cat([out3, out2], dim=-1)
+        inp4 = self.proj_mid(inp4)
+        out4 = self.blocks[3](inp4)
+
+        # ----------------------------------------------------
+        # BLOCK 5
+        # input_5 = concat([output_4 , output_3])
+        # ----------------------------------------------------
+        inp5 = torch.cat([out4, out3], dim=-1)
+        inp5 = self.proj_mid(inp5)
+        out5 = self.blocks[4](inp5)
+
+        # Final output → SAC/MLP head
+        out_final = out5.squeeze(1)  # (B, D)
+
+        return out_final, (out1, out2, out3, out4, out5)
+
+
 class TimeSformerBlock(nn.Module):
     """
     A single block of Divided Space-Time Attention.
