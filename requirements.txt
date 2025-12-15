@@ -7,3 +7,4 @@ sklearn
 pandas
 opencv-python
 scikit-learn
+osqp
