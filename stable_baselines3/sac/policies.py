@@ -115,6 +115,39 @@ class EnsembleCritic(BasePolicy):
             )
         )
         return data
+    @th.no_grad()
+    def predict(
+        self,
+        obs: PyTorchObs,
+        actions: th.Tensor,
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Predict Q-values, uncertainty and trust score.
+
+        :param obs: Observation
+        :param actions: Actions
+        :return:
+            mean_q: (batch, 1)
+            uncertainty: (batch, 1)
+            trust_score: (batch, 1)
+        """
+        q_values, uncertainty, trust_score = self.ensemble_forward(obs, actions)
+        mean_q = q_values.mean(dim=1, keepdim=True)
+        return mean_q, uncertainty, trust_score
+
+    def _predict(
+        self,
+        observation: PyTorchObs,
+        deterministic: bool = True,
+    ) -> th.Tensor:
+        """
+        Required abstract method.
+        Not used by SAC for critics.
+        """
+        raise RuntimeError(
+            "Critic _predict() is not intended for action prediction."
+        )
+
 
 
 class Actor(BasePolicy):
