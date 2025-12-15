@@ -199,8 +199,8 @@ class SpatioTemporalEncoder(nn.Module):
         
         self.num_frames = num_frames
         self.embed_dim = embed_dim
-        self.H = img_size
-        self.W = img_size
+        self.H = img_size[1]
+        self.W = img_size[0]
         self.num_patches = self.H * self.W
 
         # 1. Input Projection (CNN Channels -> Transformer Dim)

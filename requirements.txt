@@ -4,3 +4,4 @@ torch
 numpy
 cv2
 sklearn
+osqp
