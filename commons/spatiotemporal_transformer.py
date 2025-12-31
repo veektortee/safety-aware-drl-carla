@@ -266,3 +266,66 @@ class SpatioTemporalEncoder(nn.Module):
         x_final = self.norm(x_final)
         
         return x_final
+
+
+class StackedTimeSformer(nn.Module):
+        """
+        StackedTimeSformer: hierarchical combiner that mirrors the
+        contract of StackedHierarchicalTransformer but implemented using
+        TransformerBlock instances (time-aware stacking behavior).
+
+        Input:
+            - feature_map_embed: (B, D)
+            - st_embed: (B, D)
+
+        Output:
+            - out_final: (B, D)
+            - tuple of intermediate block outputs
+        """
+        def __init__(self, embed_dim=256, num_heads=8, num_blocks=5):
+                super().__init__()
+                self.embed_dim = embed_dim
+                self.num_blocks = num_blocks
+
+                # Use TransformerBlock instances for each hierarchical stage
+                self.blocks = nn.ModuleList([
+                        TransformerBlock(embed_dim, num_heads)
+                        for _ in range(num_blocks)
+                ])
+
+                # projections to match concatenation dims
+                self.proj_in = nn.Linear(embed_dim * 2, embed_dim)
+                self.proj_mid = nn.Linear(embed_dim * 2, embed_dim)
+
+        def forward(self, feature_map_embed, st_embed):
+                B, D = st_embed.shape
+                f1 = feature_map_embed.unsqueeze(1)   # (B,1,D)
+                s1 = st_embed.unsqueeze(1)            # (B,1,D)
+
+                # BLOCK 1
+                inp1 = torch.cat([f1, s1], dim=-1)
+                inp1 = self.proj_in(inp1)
+                out1 = self.blocks[0](inp1)
+
+                # BLOCK 2
+                inp2 = torch.cat([out1, s1], dim=-1)
+                inp2 = self.proj_in(inp2)
+                out2 = self.blocks[1](inp2)
+
+                # BLOCK 3
+                inp3 = torch.cat([out2, out1], dim=-1)
+                inp3 = self.proj_mid(inp3)
+                out3 = self.blocks[2](inp3)
+
+                # BLOCK 4
+                inp4 = torch.cat([out3, out2], dim=-1)
+                inp4 = self.proj_mid(inp4)
+                out4 = self.blocks[3](inp4)
+
+                # BLOCK 5
+                inp5 = torch.cat([out4, out3], dim=-1)
+                inp5 = self.proj_mid(inp5)
+                out5 = self.blocks[4](inp5)
+
+                out_final = out5.squeeze(1)
+                return out_final, (out1, out2, out3, out4, out5)

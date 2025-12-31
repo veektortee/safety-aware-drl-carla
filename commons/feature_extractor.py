@@ -105,6 +105,65 @@ class FeatureExtractor(nn.Module):
         self.trunk.to(self.device)
         return super().to(self.device)
 
+    def load_pretrained(self, path: str, strict: bool = True):
+        """
+        Load a pretrained checkpoint into the feature extractor.
+
+        The function accepts several checkpoint formats:
+          - a dict with key 'model_state' containing a state_dict
+          - a dict with key 'state_dict'
+          - a plain state_dict for the trunk or for the whole module
+
+        The method will first try to load weights into `self.trunk`. If that
+        fails it will attempt to extract a `trunk.`-prefixed sub-dict and
+        finally fall back to loading into the whole `FeatureExtractor`.
+
+        Args:
+            path: filesystem path to the .pth checkpoint
+            strict: passed to `load_state_dict` to control strictness
+        """
+        checkpoint = torch.load(path, map_location=self.device)
+
+        # Normalize to a state_dict
+        if isinstance(checkpoint, dict):
+            if "model_state" in checkpoint:
+                state_dict = checkpoint["model_state"]
+            elif "state_dict" in checkpoint:
+                state_dict = checkpoint["state_dict"]
+            else:
+                state_dict = checkpoint
+        else:
+            raise TypeError("Unsupported checkpoint format: expected dict from torch.load")
+
+        # 1) Try loading directly into trunk
+        try:
+            self.trunk.load_state_dict(state_dict, strict=strict)
+            print(f"Loaded pretrained weights into trunk from {path}")
+            return
+        except Exception:
+            pass
+
+        # 2) Try extracting keys prefixed with 'trunk.' and strip prefix
+        trunk_prefixed = {k[len('trunk.') if k.startswith('trunk.') else 0:]: v for k, v in state_dict.items() if k.startswith('trunk.')}
+        if trunk_prefixed:
+            # remove the 'trunk.' prefix from keys
+            trunk_state = {k[len('trunk.'):]: v for k, v in state_dict.items() if k.startswith('trunk.')}
+            try:
+                self.trunk.load_state_dict(trunk_state, strict=strict)
+                print(f"Loaded pretrained trunk weights (from 'trunk.' keys) from {path}")
+                return
+            except Exception:
+                pass
+
+        # 3) Try loading into the whole module (best-effort)
+        try:
+            self.load_state_dict(state_dict, strict=strict)
+            print(f"Loaded pretrained weights into FeatureExtractor from {path}")
+            return
+        except Exception as e:
+            print(f"Warning: failed to load checkpoint {path} into trunk or extractor: {e}")
+            raise
+
     # ---------------------------------------------------------------
     #                 METHOD 2: Train Feature Extractor
     # ---------------------------------------------------------------
@@ -274,8 +333,14 @@ def preprocess_frame(frame):
     frame = torch.tensor(frame, dtype=torch.float32, device='cpu')
     frame = frame.permute(2, 0, 1) / 255.0
     return frame.unsqueeze(0)  # (1, 3, 224, 224)    
-"""
+ 
+ 
+ 
+ 
 fE=FeatureExtractor() 
+fE.load_pretrained("feature_extractor.pth")  # Load pretrained weights
+
+
 cap = cv2.VideoCapture(0)
 if not cap.isOpened():
     print(" Error: Could not open webcam.")
@@ -305,5 +370,3 @@ while True:
     
 print(feat.shape)
 print(frame_buffer.shape)
-
-"""
