@@ -1,3 +1,6 @@
 [submodule "CARLA-RL-Agents"]
 	path = CARLA-RL-Agents
 	url = https://github.com/angelomorgado/CARLA-RL-Agents
+[submodule "CARLA-GymDrive"]
+	path = CARLA-GymDrive
+	url = https://github.com/angelomorgado/CARLA-GymDrive
