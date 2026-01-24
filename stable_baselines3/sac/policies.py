@@ -21,7 +21,8 @@ from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
 LOG_STD_MAX = 2
 LOG_STD_MIN = -20
 
-# In stable_baselines3/sac/policies.py (before SACPolicy class)
+
+
 
 class EnsembleCritic(BasePolicy):
     """
@@ -392,6 +393,7 @@ class SACPolicy(BasePolicy):
             "use_expln": use_expln,
             "clip_mean": clip_mean,
         }
+
         self.actor_kwargs.update(sde_kwargs)
         self.critic_kwargs = self.net_args.copy()
         self.critic_kwargs.update(

@@ -49,34 +49,24 @@ class MapControl:
         self.__active_map = self.__map_dict[map_name]
         
         print(f"Loading map: {map_name}")
-        try:
-            # Method 1: Simple load (like the test script)
-            new_world = self.__client.load_world(map_name)
-            
-            # Update the world reference
-            self.__world._World__world = new_world
-            
-            time.sleep(3)
-            self.__map = new_world.get_map()
-            print(f"Map '{map_name}' loaded successfully!")
-            
-        except RuntimeError as e:
-            print(f"ERROR: Failed to load map '{map_name}'")
-            print(f"Error details: {e}")
-            
-            # Fallback: Try with full CARLA path
-            print(f"Trying alternative path format...")
-            try:
-                carla_map_path = f"/Game/Carla/Maps/{map_name}"
-                new_world = self.__client.load_world(carla_map_path, reset_settings=False)
-                self.__world._World__world = new_world
-                time.sleep(3)
-                self.__map = new_world.get_map()
-                print(f"Map '{map_name}' loaded successfully with alternative method!")
-            except RuntimeError as e2:
-                print(f"Both methods failed. Available maps: {self.__available_maps}")
-                raise
-
+        
+        # Load map - this is blocking and returns new world
+        new_world = self.__client.load_world(map_name)
+        
+        # CRITICAL: Wait for the world to be ready
+        # Tick a few times to ensure episode is initialized
+        for _ in range(5):
+            new_world.tick()
+            time.sleep(0.1)
+        
+        # Update internal references
+        self.__world._World__world = new_world
+        self.__map = new_world.get_map()
+        
+        # Additional wait for stability
+        time.sleep(2)
+        
+        print(f"Map '{map_name}' loaded successfully!")
     def change_map(self):
         self.print_available_maps()
         map_idx = int(input('Choose a map index: '))
