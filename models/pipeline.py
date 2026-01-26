@@ -20,8 +20,8 @@ import torch.nn as nn
 import numpy as np
 
 from commons.feature_extractor import FeatureExtractor
-from commons.spatioTemporal_transformer import SpatioTemporalEncoder
-from commons.spatioTemporal_transformer import StackedHierarchicalTransformer, StackedTimeSformer
+from commons.spatiotemporal_transformer import SpatioTemporalEncoder
+from commons.spatiotemporal_transformer import StackedHierarchicalTransformer, StackedTimeSformer
 from commons.transformer_feature_extractor import TransformerFeatureExtractor
 
 
@@ -128,6 +128,24 @@ class Pipeline:
 
         # Squeeze batch dim for return
         return out_final.squeeze(0), cnn_embed.squeeze(0)
+
+    def eval(self):
+        """Set all pipeline components to evaluation mode"""
+        self.feature_extractor.eval()
+        self.st_encoder.eval()
+        self.stacked_transformer.eval()
+        self.cnn_pool.eval()
+        self.cnn_proj.eval()
+        return self
+
+    def train(self):
+        """Set all pipeline components to training mode"""
+        self.feature_extractor.train()
+        self.st_encoder.train()
+        self.stacked_transformer.train()
+        self.cnn_pool.train()
+        self.cnn_proj.train()
+        return self
 
     def build_transformer_feature_extractor(self, observation_space):
         """

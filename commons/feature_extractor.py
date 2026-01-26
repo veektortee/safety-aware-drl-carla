@@ -337,36 +337,37 @@ def preprocess_frame(frame):
  
  
  
-fE=FeatureExtractor() 
-fE.load_pretrained("feature_extractor.pth")  # Load pretrained weights
+#fE=FeatureExtractor() 
+#fE.load_pretrained(r"D:/CARLA/SDCRepo/commons/feature_extractor.pth")  # Load pretrained weights
 
 
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print(" Error: Could not open webcam.")
+#cap = cv2.VideoCapture(0)
+#if not cap.isOpened():
+#    print(" Error: Could not open webcam.")
     
-    frame_buffer = []
+#    frame_buffer = []
 
-    print(" Running model test. Press 'q' to quit.")
+#    print(" Running model test. Press 'q' to quit.")
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print(" Failed to grab frame.")
-        break
+#while True:
+#    ret, frame = cap.read()
+#    if not ret:
+#        print(" Failed to grab frame.")
+#        break
 
         # Show webcam feed
-    cv2.imshow("Webcam", frame)
+ #   cv2.imshow("Webcam", frame)
     
     # Preprocess
-    tensor_frame = preprocess_frame(frame)
+  #  tensor_frame = preprocess_frame(frame)
         
     # Extract rich feature map
-    with torch.no_grad():
-        feat = fE.extractFeatures(tensor_frame)  # (1, D)
-            
-    frame_buffer.append(feat)
+   # with torch.no_grad():
+    #    feat = fE.extractFeatures(tensor_frame)  # (1, D)
+     #   frame_buffer.append(feat)
     
     
-print(feat.shape)
-print(frame_buffer.shape)
+#print(feat.shape)
+#print(frame_buffer.shape)
+
+    
