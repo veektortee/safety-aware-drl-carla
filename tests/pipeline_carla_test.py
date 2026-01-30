@@ -66,7 +66,8 @@ class CarlaGymEnv(gym.Env):
         time_limit: int = 60,
         render_mode: Optional[str] = None,
         num_npc_vehicles: int = 20,
-        num_pedestrians: int = 30
+        num_pedestrians: int = 30,
+        show_sensor_data: bool = False
     ):
         """Initialize CARLA environment"""
         self.host = host
@@ -76,6 +77,7 @@ class CarlaGymEnv(gym.Env):
         self.render_mode = render_mode
         self.num_npc_vehicles = num_npc_vehicles
         self.num_pedestrians = num_pedestrians
+        self.show_sensor_data = show_sensor_data
         
         # CARLA objects
         self.client = None
@@ -466,6 +468,15 @@ class CarlaGymEnv(gym.Env):
         obs = self._get_observation()
         reward = self._compute_reward()
         
+        # Update spectator camera to track ego vehicle
+        self.render()
+        
+        # Display RGB sensor data if enabled
+        if self.show_sensor_data and self.rgb_data is not None:
+            rgb_display = cv2.cvtColor(self.rgb_data, cv2.COLOR_BGR2RGB)
+            cv2.imshow('CARLA RGB Camera', rgb_display)
+            cv2.waitKey(1)
+        
         # Termination conditions
         terminated = self.collision_occurred or self._episode_step >= self.time_limit
         truncated = False
@@ -671,7 +682,8 @@ def create_carla_env(
     time_limit: int = 60,
     render: bool = False,
     num_npc: int = 20,
-    num_pedestrians: int = 30
+    num_pedestrians: int = 30,
+    show_sensor_data: bool = False
 ) -> gym.Env:
     """Create CARLA environment with wrappers"""
     
@@ -680,7 +692,8 @@ def create_carla_env(
         time_limit=time_limit,
         render_mode="human" if render else None,
         num_npc_vehicles=num_npc,
-        num_pedestrians=num_pedestrians
+        num_pedestrians=num_pedestrians,
+        show_sensor_data=show_sensor_data
     )
     
     # Wrap with pipeline
@@ -719,7 +732,7 @@ def train_sac_agent(
     
     # Create environment
     print("Initializing CARLA environment...")
-    env = create_carla_env(time_limit=60, render=render, num_npc=20, num_pedestrians=30)
+    env = create_carla_env(time_limit=60, render=render, num_npc=20, num_pedestrians=30, show_sensor_data=True)
     print("✓ Environment created\n")
     
     # Create SAC model
