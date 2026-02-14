@@ -147,7 +147,7 @@ class CarlaGymEnv(gym.Env):
         self.blueprint_library = self.world.get_blueprint_library()
         self.spectator = self.world.get_spectator()
         
-        print("✓ Connected to CARLA")
+        print("[OK] Connected to CARLA")
     
     def _setup_world(self):
         """Setup world settings (synchronous mode, etc)"""
@@ -156,17 +156,27 @@ class CarlaGymEnv(gym.Env):
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = 0.05  # 20 FPS
         self.world.apply_settings(settings)
-        print("✓ Synchronous mode enabled (20 FPS)")
+        print("[OK] Synchronous mode enabled (20 FPS)")
     
     def _spawn_actors(self):
         """Spawn ego vehicle, NPCs, and pedestrians"""
-        # Spawn ego vehicle
+        # Spawn ego vehicle with retry
         ego_bp = self.blueprint_library.filter("vehicle.tesla.model3")[0]
-        spawn_point = random.choice(self.map.get_spawn_points())
+        spawn_points = self.map.get_spawn_points()
         
-        self.ego_vehicle = self.world.spawn_actor(ego_bp, spawn_point)
-        self.ego_vehicle.set_autopilot(False)  # Manual control via agent
-        print(f"✓ Ego vehicle spawned at {spawn_point.location}")
+        self.ego_vehicle = None
+        for spawn_point in spawn_points:
+            try:
+                self.ego_vehicle = self.world.spawn_actor(ego_bp, spawn_point)
+                self.ego_vehicle.set_autopilot(False)  # Manual control via agent
+                print(f"[OK] Ego vehicle spawned at {spawn_point.location}")
+                break
+            except RuntimeError:
+                continue
+        
+        if self.ego_vehicle is None:
+            print("ERROR: Could not spawn ego vehicle")
+            return
         
         # Spawn NPC vehicles
         vehicle_bps = self.blueprint_library.filter("vehicle.*")
@@ -181,7 +191,7 @@ class CarlaGymEnv(gym.Env):
             except Exception as e:
                 pass  # Skip if spawn fails
         
-        print(f"✓ Spawned {len(self.npc_vehicles)} NPC vehicles")
+        print(f"[OK] Spawned {len(self.npc_vehicles)} NPC vehicles")
         
         # Spawn pedestrians
         walker_bps = self.blueprint_library.filter("walker.pedestrian.*")
@@ -216,7 +226,7 @@ class CarlaGymEnv(gym.Env):
             except Exception as e:
                 pass
         
-        print(f"✓ Spawned {len(self.walkers)} pedestrians")
+        print(f"[OK] Spawned {len(self.walkers)} pedestrians")
     
     def _attach_sensors(self):
         """Attach RGB, LiDAR, collision, lane invasion, and depth sensors"""
@@ -232,7 +242,7 @@ class CarlaGymEnv(gym.Env):
         rgb_transform = carla.Transform(carla.Location(x=0.8, z=1.7))
         self.rgb_camera = self.world.spawn_actor(rgb_bp, rgb_transform, attach_to=self.ego_vehicle)
         self.rgb_camera.listen(self._on_rgb_image)
-        print("✓ RGB camera attached")
+        print("[OK] RGB camera attached")
         
         # LiDAR Sensor
         lidar_bp = self.blueprint_library.find('sensor.lidar.ray_cast')
@@ -244,7 +254,7 @@ class CarlaGymEnv(gym.Env):
         lidar_transform = carla.Transform(carla.Location(z=1.7))
         self.lidar_sensor = self.world.spawn_actor(lidar_bp, lidar_transform, attach_to=self.ego_vehicle)
         self.lidar_sensor.listen(self._on_lidar_data)
-        print("✓ LiDAR sensor attached")
+        print("[OK] LiDAR sensor attached")
         
         # Depth Camera
         depth_bp = self.blueprint_library.find('sensor.camera.depth')
@@ -255,19 +265,19 @@ class CarlaGymEnv(gym.Env):
         depth_transform = carla.Transform(carla.Location(x=0.8, z=1.7))
         self.depth_sensor = self.world.spawn_actor(depth_bp, depth_transform, attach_to=self.ego_vehicle)
         self.depth_sensor.listen(self._on_depth_image)
-        print("✓ Depth camera attached")
+        print("[OK] Depth camera attached")
         
         # Collision Sensor
         collision_bp = self.blueprint_library.find('sensor.other.collision')
         self.collision_sensor = self.world.spawn_actor(collision_bp, carla.Transform(), attach_to=self.ego_vehicle)
         self.collision_sensor.listen(self._on_collision)
-        print("✓ Collision sensor attached")
+        print("[OK] Collision sensor attached")
         
         # Lane Invasion Sensor
         lane_inv_bp = self.blueprint_library.find('sensor.other.lane_invasion')
         self.lane_invasion_sensor = self.world.spawn_actor(lane_inv_bp, carla.Transform(), attach_to=self.ego_vehicle)
         self.lane_invasion_sensor.listen(self._on_lane_invasion)
-        print("✓ Lane invasion sensor attached")
+        print("[OK] Lane invasion sensor attached")
     
     def _on_rgb_image(self, image):
         """RGB camera callback"""
@@ -551,7 +561,7 @@ class CarlaGymEnv(gym.Env):
             except:
                 pass
         
-        print("✓ All actors destroyed")
+        print("[OK] All actors destroyed")
 
 
 # ============================================================================
@@ -733,7 +743,7 @@ def train_sac_agent(
     # Create environment
     print("Initializing CARLA environment...")
     env = create_carla_env(time_limit=60, render=render, num_npc=20, num_pedestrians=30, show_sensor_data=True)
-    print("✓ Environment created\n")
+    print("[OK] Environment created\n")
     
     # Create SAC model
     print("Initializing SAC agent...")
@@ -749,7 +759,7 @@ def train_sac_agent(
         train_freq=1,
         gradient_steps=1
     )
-    print("✓ SAC agent created\n")
+    print("[OK] SAC agent created\n")
     
     # Setup TensorBoard
     new_logger = configure(tb_dir, ["stdout", "tensorboard"])
@@ -784,11 +794,11 @@ def train_sac_agent(
     # Save final model
     final_path = os.path.join(log_dir, "sac_carla_cbf_final")
     model.save(final_path)
-    print(f"\n✓ Final model saved to {final_path}")
+    print(f"\n[OK] Final model saved to {final_path}")
     
     # Cleanup
     env.close()
-    print("✓ Environment closed")
+    print("[OK] Environment closed")
     
     print("\n" + "=" * 70)
     print("TRAINING COMPLETE")

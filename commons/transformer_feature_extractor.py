@@ -13,7 +13,7 @@ from typing import Dict, Any, Optional
 import torch as th
 import torch.nn as nn
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from sac_head_adapter import SACHeadAdapter
+from commons.sac_head_adapter import SACHeadAdapter
 from torchvision import models
 import numpy as np
 

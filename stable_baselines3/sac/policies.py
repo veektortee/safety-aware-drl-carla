@@ -524,6 +524,7 @@ class CnnPolicy(SACPolicy):
     :param optimizer_kwargs: Additional keyword arguments,
         excluding the learning rate, to pass to the optimizer
     :param n_critics: Number of critic networks to create.
+    :param trust_lambda: Lambda hyperparameter for trust scoring (exp(-lambda * var))
     :param share_features_extractor: Whether to share or not the features extractor
         between the actor and the critic (this saves computation time)
     """
@@ -544,7 +545,8 @@ class CnnPolicy(SACPolicy):
         normalize_images: bool = True,
         optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[dict[str, Any]] = None,
-        n_critics: int = 2,
+        n_critics: int = 5,
+        trust_lambda: float = 0.01,
         share_features_extractor: bool = False,
     ):
         super().__init__(
@@ -563,6 +565,7 @@ class CnnPolicy(SACPolicy):
             optimizer_class,
             optimizer_kwargs,
             n_critics,
+            trust_lambda,
             share_features_extractor,
         )
 
@@ -590,6 +593,7 @@ class MultiInputPolicy(SACPolicy):
     :param optimizer_kwargs: Additional keyword arguments,
         excluding the learning rate, to pass to the optimizer
     :param n_critics: Number of critic networks to create.
+    :param trust_lambda: Lambda hyperparameter for trust scoring (exp(-lambda * var))
     :param share_features_extractor: Whether to share or not the features extractor
         between the actor and the critic (this saves computation time)
     """
@@ -610,7 +614,8 @@ class MultiInputPolicy(SACPolicy):
         normalize_images: bool = True,
         optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[dict[str, Any]] = None,
-        n_critics: int = 2,
+        n_critics: int = 5,
+        trust_lambda: float = 0.01,
         share_features_extractor: bool = False,
     ):
         super().__init__(
@@ -629,5 +634,6 @@ class MultiInputPolicy(SACPolicy):
             optimizer_class,
             optimizer_kwargs,
             n_critics,
+            trust_lambda,
             share_features_extractor,
         )
