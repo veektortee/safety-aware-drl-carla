@@ -16,20 +16,27 @@ from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import cv2
 import argparse
+import sys
 import os
 import time
 from collections import deque
 from datetime import datetime
 import json
 
-# CARLA imports
-from src.env.environment import CarlaEnv
-import src.config.configuration as config
+# Add project paths for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# CARLA imports - use direct CARLA API like pipeline_carla_test.py
+try:
+    import carla
+except ImportError:
+    raise RuntimeError("CARLA module not found. Install via CARLA PythonAPI")
 
 # Model imports
 from models.pipeline import Pipeline
-from commons.spatioTemporal_transformer import SpatioTemporalEncoder
+from commons.spatiotemporal_transformer import SpatioTemporalEncoder
 from commons.feature_extractor import FeatureExtractor
+from tests.pipeline_carla_test import CarlaGymEnv
 
 
 class ContrastiveLoss(nn.Module):
@@ -239,8 +246,11 @@ class EncoderTrainer:
         future_predictions = self.prediction_head(current_embedding)  # (1, F, D)
         
         # Get actual future embeddings
-        if len(future_features) > 0:
-            future_tensor = torch.stack(future_features, dim=0).unsqueeze(0)
+        pred_loss = torch.tensor(0.0).to(self.device)
+        
+        if len(future_features) >= self.sequence_length:
+            # Only compute future embedding if we have enough frames
+            future_tensor = torch.stack(future_features[:self.sequence_length], dim=0).unsqueeze(0)
             with torch.no_grad():
                 future_embeddings = self.st_encoder(future_tensor)  # (1, D)
             
@@ -249,8 +259,24 @@ class EncoderTrainer:
                 future_predictions[:, 0, :],  # Predict next step
                 future_embeddings
             )
-        else:
-            pred_loss = torch.tensor(0.0).to(self.device)
+        elif len(future_features) > 0:
+            # Pad future features to sequence_length by repeating last frame
+            future_list = list(future_features)
+            last_feature = future_list[-1]
+            
+            # Pad to sequence_length
+            while len(future_list) < self.sequence_length:
+                future_list.append(last_feature)
+            
+            future_tensor = torch.stack(future_list, dim=0).unsqueeze(0)
+            with torch.no_grad():
+                future_embeddings = self.st_encoder(future_tensor)  # (1, D)
+            
+            # Prediction loss
+            pred_loss = self.prediction_loss(
+                future_predictions[:, 0, :],  # Predict next step
+                future_embeddings
+            )
         
         # Contrastive loss (self-supervised)
         # Create augmented views by temporal jittering
@@ -398,7 +424,7 @@ class EncoderTrainer:
         }
         
         torch.save(checkpoint, filepath)
-        print(f"✓ Checkpoint saved: {filepath}")
+        print(f"[OK] Checkpoint saved: {filepath}")
     
     def load_checkpoint(self, filepath):
         """Load model checkpoint"""
@@ -412,7 +438,7 @@ class EncoderTrainer:
         self.episode_count = checkpoint['episode']
         self.global_step = checkpoint['global_step']
         
-        print(f"✓ Checkpoint loaded: {filepath}")
+        print(f"[OK] Checkpoint loaded: {filepath}")
 
 
 def main(args):
@@ -438,20 +464,18 @@ def main(args):
     
     # Initialize CARLA environment
     print("\nInitializing CARLA environment...")
-    env = CarlaEnv(
-        continuous=True,
+    env = CarlaGymEnv(
+        host='localhost',
+        port=2000,
+        timeout=10.0,
         time_limit=args.time_limit,
-        initialize_server=not args.no_server,
-        random_weather=True,
-        synchronous_mode=True,
-        show_sensor_data=args.show_sensors,
-        random_traffic=True,
-        has_traffic=True,
-        autopilot=args.autopilot,
-        verbose=True
+        render_mode='human' if args.show_sensors else None,
+        num_npc_vehicles=20,
+        num_pedestrians=30,
+        show_sensor_data=args.show_sensors
     )
     
-    print("✓ Environment initialized\n")
+    print("[OK] Environment initialized\n")
     
     # Training loop
     try:
@@ -503,9 +527,7 @@ if __name__ == "__main__":
     
     # Environment parameters
     parser.add_argument('--time_limit', type=int, default=60, help='Episode time limit (seconds)')
-    parser.add_argument('--no_server', action='store_true', help='Do not start CARLA server')
     parser.add_argument('--show_sensors', action='store_true', help='Show sensor visualization')
-    parser.add_argument('--autopilot', action='store_true', help='Use autopilot for ego vehicle')
     
     # Model parameters
     parser.add_argument('--use_timesformer', action='store_true', help='Use TimeSformer instead of hierarchical')

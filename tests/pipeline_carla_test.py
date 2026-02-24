@@ -113,11 +113,15 @@ class CarlaGymEnv(gym.Env):
         self._speed_limit_check_counter = 0
         self._current_speed_limit = 15.0
         self._episode_step = 0
+        self._collision_count = 0
+        self._cbf_correction_count = 0
+        self._avg_correction_mag = 0.0
         
         # Action/Observation spaces
+        # 3D action space: [steering, throttle, brake] for CBF compatibility
         self.action_space = spaces.Box(
-            low=np.array([-1.0, -1.0], dtype=np.float32),
-            high=np.array([1.0, 1.0], dtype=np.float32),
+            low=np.array([-1.0, -1.0, -1.0], dtype=np.float32),
+            high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
             dtype=np.float32
         )
         
@@ -313,6 +317,7 @@ class CarlaGymEnv(gym.Env):
     def _on_collision(self, event):
         """Collision callback"""
         self.collision_occurred = True
+        self._collision_count += 1
     
     def _on_lane_invasion(self, event):
         """Lane invasion callback"""
@@ -402,7 +407,8 @@ class CarlaGymEnv(gym.Env):
             'd_collision': float(d_collision),
             'ttc': float(ttc),
             'lane_offset': float(lane_offset),
-            'speed': float(current_speed)
+            'speed': float(current_speed),
+            'speed_limit': float(speed_limit)  # Add dynamic speed limit for CBF
         }
     
     def _get_observation(self) -> Dict:
@@ -453,20 +459,27 @@ class CarlaGymEnv(gym.Env):
     
     def step(self, action: np.ndarray) -> Tuple[Dict, float, bool, bool, Dict]:
         """Execute one environment step"""
-        # Parse action [steer, throttle/brake]
+        # Parse 3D action: [steering, throttle, brake]
+        # Each is in range [-1, 1]
         steer = float(np.clip(action[0], -1.0, 1.0))
-        throttle_brake = float(np.clip(action[1], -1.0, 1.0))
+        throttle = float(np.clip(action[1], -1.0, 1.0))
+        brake = float(np.clip(action[2], -1.0, 1.0))
+        
+        # Clamp to [0, 1] for CARLA (can't apply both throttle and brake)
+        throttle = max(0.0, throttle)  # Throttle is [0, 1]
+        brake = max(0.0, brake)        # Brake is [0, 1]
+        
+        # Normalize if both are non-zero (shouldn't happen, but safety)
+        total = throttle + brake
+        if total > 1.0:
+            throttle /= total
+            brake /= total
         
         # Convert to CARLA control
         control = carla.VehicleControl()
         control.steer = steer
-        
-        if throttle_brake > 0:
-            control.throttle = throttle_brake
-            control.brake = 0.0
-        else:
-            control.throttle = 0.0
-            control.brake = -throttle_brake
+        control.throttle = throttle
+        control.brake = brake
         
         self.ego_vehicle.apply_control(control)
         
@@ -507,6 +520,9 @@ class CarlaGymEnv(gym.Env):
         self._collision_distance = 100.0
         self._lane_invasion_count = 0
         self._speed_limit_violation_count = 0
+        self._collision_count = 0
+        self._cbf_correction_count = 0
+        self._avg_correction_mag = 0.0
         self.collision_occurred = False
         self.lane_invaded = False
         
@@ -562,6 +578,17 @@ class CarlaGymEnv(gym.Env):
                 pass
         
         print("[OK] All actors destroyed")
+    
+    @property
+    def safety_metrics(self) -> Dict:
+        """Expose safety metrics for callback logging"""
+        return {
+            'lane_invasions': self._lane_invasion_count,
+            'speed_violations': self._speed_limit_violation_count,
+            'collisions': self._collision_count,
+            'cbf_corrections': self._cbf_correction_count,
+            'cbf_correction_magnitude': self._avg_correction_mag,
+        }
 
 
 # ============================================================================
@@ -631,17 +658,36 @@ class PipelineObservationWrapper(gym.ObservationWrapper):
 # ============================================================================
 
 class CBFSafetyLayerWrapper(gym.ActionWrapper):
-    """Applies CBF safety corrections to actions"""
+    """
+    Applies CBF safety corrections to actions
+    Tracks corrections and integrates with trust scoring
+    """
     
-    def __init__(self, env: gym.Env, alpha: float = 1.0):
+    def __init__(self, env: gym.Env, alpha: float = 1.0, use_trust_score: bool = True, correction_penalty: float = 0.01):
         super().__init__(env)
         
         self.cbf_layer = CBFSafetyLayer(alpha=alpha, d_min=5.0, y_max=1.5, v_max=15.0)
+        self.use_trust_score = use_trust_score
+        self.correction_penalty = correction_penalty
+        
+        # Metrics for tracking
         self.correction_count = 0
         self.correction_magnitudes = []
+        self.episode_corrections = 0
+        self.episode_correction_mag = 0.0
+        self.last_correction_mag = 0.0
     
-    def action(self, action: np.ndarray) -> np.ndarray:
-        """Apply CBF correction if violation detected"""
+    def action(self, action: np.ndarray, trust_score: float = 1.0) -> np.ndarray:
+        """
+        Apply CBF correction if violation detected
+        
+        Args:
+            action: np.ndarray shape (3,) - [steer, throttle, brake]
+            trust_score: float in [0, 1] - ensemble confidence (optional)
+        
+        Returns:
+            safe_action: np.ndarray shape (3,) - corrected action
+        """
         # Get current state
         try:
             current_obs = self.env.unwrapped._get_observation()
@@ -651,23 +697,59 @@ class CBFSafetyLayerWrapper(gym.ActionWrapper):
         
         cbf_state = self.env.unwrapped.build_cbf_state(current_speed)
         
-        # Check violations
-        violation = False
-        if cbf_state['d_collision'] < 5.0 or abs(cbf_state['lane_offset']) > 1.5:
-            violation = True
-        
-        # Apply CBF correction
-        safe_action = action.copy()
-        if violation:
-            try:
-                safe_action = self.cbf_layer.compute_safe_action(action, cbf_state)
+        # Apply CBF correction with trust score modulation
+        try:
+            safe_action = self.cbf_layer.compute_safe_action(
+                action, 
+                cbf_state,
+                trust_score=trust_score if self.use_trust_score else 1.0
+            )
+            
+            # Track correction metrics
+            correction_mag = float(np.linalg.norm(safe_action - action))
+            self.last_correction_mag = correction_mag
+            
+            if correction_mag > 0.01:  # Only count non-negligible corrections
                 self.correction_count += 1
-                correction_mag = float(np.linalg.norm(safe_action - action))
+                self.episode_corrections += 1
                 self.correction_magnitudes.append(correction_mag)
-            except Exception as e:
-                print(f"CBF correction failed: {e}")
+                self.episode_correction_mag = np.mean(self.correction_magnitudes[-100:])  # Rolling avg
+            
+            # Update environment's safety metrics
+            if hasattr(self.env.unwrapped, '_cbf_correction_count'):
+                self.env.unwrapped._cbf_correction_count = self.correction_count
+            if hasattr(self.env.unwrapped, '_avg_correction_mag'):
+                self.env.unwrapped._avg_correction_mag = self.episode_correction_mag
+        
+        except Exception as e:
+            print(f"[CBF] Correction failed: {e}")
+            safe_action = action.copy()
+            self.last_correction_mag = 0.0
         
         return np.clip(safe_action, -1.0, 1.0)
+    
+    def step(self, action: np.ndarray):
+        """Override step to apply CBF corrections and add reward penalty"""
+        # Apply CBF safety layer to action
+        safe_action = self.action(action, trust_score=1.0)
+        
+        # Call parent step with safe action
+        obs, reward, terminated, truncated, info = self.env.step(safe_action)
+        
+        # Apply penalty for CBF corrections to encourage safety learning
+        if self.last_correction_mag > 0.01:
+            correction_penalty = self.correction_penalty * self.last_correction_mag
+            reward -= correction_penalty
+        
+        return obs, reward, terminated, truncated, info
+    
+    def reset(self, **kwargs):
+        """Reset episode metrics"""
+        self.episode_corrections = 0
+        self.episode_correction_mag = 0.0
+        self.last_correction_mag = 0.0
+        self.cbf_layer.reset_metrics()
+        return self.env.reset(**kwargs)
 
 
 # ============================================================================

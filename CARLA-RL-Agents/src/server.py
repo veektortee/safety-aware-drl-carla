@@ -16,6 +16,38 @@ class CarlaServer:
     def initialize_server(low_quality = False, offscreen_rendering = False, silent = False, sleep_time = 10):
         # Get environment variable CARLA_SERVER that contains the path to the Carla server directory
         carla_server = os.getenv('CARLA_SERVER')
+        
+        # If CARLA_SERVER is not set, raise an error with instructions
+        if carla_server is None:
+            error_msg = """
+╔═══════════════════════════════════════════════════════════════╗
+║ CARLA SERVER PATH NOT FOUND                                   ║
+╚═══════════════════════════════════════════════════════════════╝
+
+The CARLA_SERVER environment variable is not set.
+
+TO FIX THIS, either:
+  
+  Option 1: Set environment variable in PowerShell (temporary)
+    $env:CARLA_SERVER = "C:\\path\\to\\CARLA"
+    
+  Option 2: Set environment variable permanently (Windows)
+    [Environment]::SetEnvironmentVariable(
+        "CARLA_SERVER",
+        "C:\\path\\to\\CARLA",
+        [EnvironmentVariableTarget]::User
+    )
+    
+  Option 3: Start CARLA server manually, then use --no_server flag
+    python training/encoder_training.py --no_server
+    
+CARLA Installation:
+  - Download from: https://github.com/carla-simulator/carla/releases
+  - Extract to a directory (e.g., C:\\CARLA or C:\\carla-0.9.15)
+  - Set CARLA_SERVER to that directory
+  - Run CarlaUE4.exe or CarlaUE4.sh from that directory
+            """
+            raise RuntimeError(error_msg.strip())
 
         # If it is Unix add the CarlaUE4.sh to the path else add CarlaUE4.exe
         if os.name == 'posix':

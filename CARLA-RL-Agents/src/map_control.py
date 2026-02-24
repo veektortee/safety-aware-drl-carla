@@ -26,13 +26,37 @@ class MapControl:
     
     def set_active_map(self, map_name, reload_map=False):
         # Check if the map is already loaded
+        if map_name not in self.__map_dict:
+            # Map not found - use first available map instead
+            print(f"[WARNING] Map '{map_name}' not found. Using first available: {list(self.__map_dict.keys())[0]}")
+            map_name = list(self.__map_dict.keys())[0]
+        
         if self.__map_dict[map_name] == self.__active_map and not reload_map:
             return
         
         self.__active_map = self.__map_dict[map_name]
         if map_name in ["Town15", "Town11", "Town12", "Town13"]:
-            map_name += f"/{map_name}"
-        self.__client.load_world('/Game/Carla/Maps/' + map_name)
+            map_name_full = f"{map_name}/{map_name}"
+        else:
+            map_name_full = map_name
+        
+        # Load map with forward slashes (required by CARLA)
+        map_path = f'/Game/Carla/Maps/{map_name_full}'
+        print(f"[INFO] Loading map: {map_path}")
+        
+        try:
+            self.__client.load_world(map_path)
+        except RuntimeError as e:
+            # If map not found, try first available map
+            print(f"[ERROR] {e}")
+            available = list(self.__map_dict.keys())
+            if map_name != available[0]:
+                print(f"[FALLBACK] Trying first available map: {available[0]}")
+                self.set_active_map(available[0], reload_map=reload_map)
+                return
+            else:
+                raise
+        
         time.sleep(3)
         self.__map = self.__world.get_map()
 
