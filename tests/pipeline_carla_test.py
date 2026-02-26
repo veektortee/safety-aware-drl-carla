@@ -65,7 +65,7 @@ class CarlaGymEnv(gym.Env):
         timeout: float = 10.0,
         time_limit: int = 60,
         render_mode: Optional[str] = None,
-        num_npc_vehicles: int = 20,
+        num_npc_vehicles: int = 100,
         num_pedestrians: int = 30,
         show_sensor_data: bool = False
     ):
@@ -164,38 +164,77 @@ class CarlaGymEnv(gym.Env):
     
     def _spawn_actors(self):
         """Spawn ego vehicle, NPCs, and pedestrians"""
-        # Spawn ego vehicle with retry
-        ego_bp = self.blueprint_library.filter("vehicle.tesla.model3")[0]
+        # STEP 1: Clear all existing actors from the map
+        print("[S] Clearing existing actors from map...")
+        actors = self.world.get_actors()
+        for actor in actors:
+            if actor.type_id.startswith('vehicle') or actor.type_id.startswith('walker') or actor.type_id.startswith('sensor'):
+                try:
+                    actor.destroy()
+                except:
+                    pass
+        print("[OK] Map cleared\n")
+        
+        # STEP 2: Spawn ego vehicle first
+        print("[S] Spawning ego vehicle...")
         spawn_points = self.map.get_spawn_points()
+        
+        # Try different vehicle blueprints
+        blueprint_options = [
+            "vehicle.tesla.model3",
+            "vehicle.audi.a2",
+            "vehicle.carlamotors.carlacola",
+            "vehicle.dodge.charger",
+            "vehicle.bmw.grandtourer"
+        ]
+        
+        ego_bp = None
+        for bp_filter in blueprint_options:
+            filtered = self.blueprint_library.filter(bp_filter)
+            if len(filtered) > 0:
+                ego_bp = filtered[0]
+                break
+        
+        if ego_bp is None:
+            # Fallback: use any vehicle
+            ego_bp = self.blueprint_library.filter("vehicle.*")[0]
         
         self.ego_vehicle = None
         for spawn_point in spawn_points:
             try:
                 self.ego_vehicle = self.world.spawn_actor(ego_bp, spawn_point)
                 self.ego_vehicle.set_autopilot(False)  # Manual control via agent
-                print(f"[OK] Ego vehicle spawned at {spawn_point.location}")
+                print(f"[OK] Ego vehicle spawned at location ({spawn_point.location.x:.1f}, {spawn_point.location.y:.1f}, {spawn_point.location.z:.1f})\n")
                 break
             except RuntimeError:
                 continue
         
         if self.ego_vehicle is None:
-            print("ERROR: Could not spawn ego vehicle")
+            print("[ERROR] Could not spawn ego vehicle - no spawn points available\n")
             return
         
-        # Spawn NPC vehicles
+        # STEP 3: Spawn NPC vehicles (after ego vehicle)
+        print(f"[S] Spawning {self.num_npc_vehicles} NPC vehicles...")
         vehicle_bps = self.blueprint_library.filter("vehicle.*")
         spawn_points = self.map.get_spawn_points()
         
-        for sp in spawn_points[:self.num_npc_vehicles]:
+        # Skip the first spawn point (used by ego)
+        available_spawn_points = spawn_points[1:]
+        
+        npc_count = 0
+        max_npcs = min(self.num_npc_vehicles, len(available_spawn_points))
+        
+        for sp in available_spawn_points[:max_npcs]:
             try:
                 bp = random.choice(vehicle_bps)
                 v = self.world.spawn_actor(bp, sp)
                 v.set_autopilot(True)
                 self.npc_vehicles.append(v)
-            except Exception as e:
+                npc_count += 1
+            except Exception:
                 pass  # Skip if spawn fails
         
-        print(f"[OK] Spawned {len(self.npc_vehicles)} NPC vehicles")
+        print(f"[OK] Spawned {npc_count} NPC vehicles\n")
         
         # Spawn pedestrians
         walker_bps = self.blueprint_library.filter("walker.pedestrian.*")
@@ -411,8 +450,20 @@ class CarlaGymEnv(gym.Env):
             'speed_limit': float(speed_limit)  # Add dynamic speed limit for CBF
         }
     
+    def _get_empty_observation(self) -> Dict:
+        """Return empty observation (for error cases)"""
+        return {
+            'rgb_data': np.zeros((360, 640, 3), dtype=np.uint8),
+            'lidar_data': np.zeros((3, 500), dtype=np.float32),
+            'position': np.zeros((3,), dtype=np.float32),
+            'speed': np.zeros((1,), dtype=np.float32),
+            'heading': np.zeros((1,), dtype=np.float32),
+        }
+    
     def _get_observation(self) -> Dict:
         """Get current observation"""
+        if self.ego_vehicle is None:
+            return self._get_empty_observation()  # or however your env returns a blank obs
         location = self.ego_vehicle.get_location()
         velocity = self.ego_vehicle.get_velocity()
         transform = self.ego_vehicle.get_transform()

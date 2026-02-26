@@ -215,7 +215,7 @@ class CarlaVisualizationWrapper(gym.Wrapper):
 def create_training_env(
     headless: bool = True,
     time_limit: int = 1000,
-    num_npc: int = 20,
+    num_npc: int = 100,
     perception_enabled: bool = True
 ):
     """
@@ -437,7 +437,7 @@ def evaluate_trained_agent(
     model_path: str,
     num_episodes: int = 5,
     headless: bool = True,
-    num_npc: int = 20,
+    num_npc: int = 100,
 ):
     """
     Evaluate trained SAC agent.
