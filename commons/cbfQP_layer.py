@@ -268,6 +268,8 @@ class CBFSafetyLayer:
                 print(f"[CBF-SOLVER] Status: '{res.info.status}' | Constraints: {len(A)} | Iter: {res.info.iter}")
 
             if res.info.status != "solved":
+                print(f"[CBF-SOLVER-FAIL] Status: '{res.info.status}' | Constraints: {len(A)} | Fallback action will be used")
+                print(f"  State - d_collision: {state.get('d_collision', 0):.2f}m, speed: {state.get('speed', 0):.2f}m/s, lane_offset: {state.get('lane_offset', 0):.2f}m")
                 if verbose:
                     print(f"[CBF-WARNING] Solver status not 'solved' - using fallback action")
                 # Fallback: verify and use previous action
@@ -276,6 +278,7 @@ class CBFSafetyLayer:
                 u_safe = res.x
         except Exception as e:
             print(f"[CBF] QP solver exception: {e}")
+            print(f"  State: d_collision={state.get('d_collision', 0)}, speed={state.get('speed', 0)}, lane_offset={state.get('lane_offset', 0)}")
             u_safe = self._fallback_safe_action(state)
 
         # =============================================
@@ -339,8 +342,9 @@ class CBFSafetyLayer:
         violations = self._check_constraint_violations(u_fallback, state)
         
         if violations['collision'] or violations['lane'] or violations['speed']:
-            # If previous action violates, apply emergency brake cautiously
-            u_fallback = np.array([0.0, 0.0, 0.5])  # Moderate brake (not max)
+            # If previous action violates, use gentle throttle + light brake
+            # Changed from [0, 0, 0.5] (pure brake) to allow forward movement
+            u_fallback = np.array([0.0, 0.1, 0.0])  # Gentle throttle, no brake
         
         return u_fallback
 

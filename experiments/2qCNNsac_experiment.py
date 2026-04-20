@@ -165,9 +165,19 @@ class SafetyMetricsCallback(BaseCallback):
                 env = self.training_env.envs[0].unwrapped
                 if hasattr(env, 'safety_metrics'):
                     metrics = env.safety_metrics
-                    self.logger.record("safety/collisions", metrics.get('collisions', 0))
+                    # Collision tracking (Phase 5)
+                    self.logger.record("safety/collisions_episode", metrics.get('collisions', 0))
                     self.logger.record("safety/lane_invasions", metrics.get('lane_invasions', 0))
-                    self.logger.record("safety/cbf_corrections", metrics.get('cbf_corrections', 0))
+                    # CBF corrections - per-episode (Phase 5)
+                    self.logger.record("safety/cbf_corrections_episode", metrics.get('cbf_corrections_episode', 0))
+                    self.logger.record("safety/cbf_correction_magnitude", metrics.get('cbf_correction_magnitude', 0.0))
+                    # Waypoint completion - normalized 0-1 (Phase 5)
+                    self.logger.record("navigation/waypoint_completion_ratio", metrics.get('waypoint_completion', 0.0))
+                    self.logger.record("navigation/waypoints_crossed", metrics.get('waypoints_crossed', 0))
+                    self.logger.record("navigation/total_waypoints", metrics.get('total_waypoints', 0))
+                    # Endpoint detection (Phase 5)
+                    self.logger.record("navigation/endpoint_distance", metrics.get('endpoint_distance', 9999.0))
+                    self.logger.record("navigation/endpoint_reached", metrics.get('endpoint_reached', 0.0))
             except:
                 pass
         
@@ -191,6 +201,9 @@ class TrustScoreCallback(BaseCallback):
                     # SAC's entropy coefficient (auto-adjusted by algorithm)
                     if isinstance(self.model.ent_coef, torch.Tensor):
                         ent_coef = self.model.ent_coef.detach().cpu().item()
+                    elif isinstance(self.model.ent_coef, str) and self.model.ent_coef == 'auto':
+                        # Auto entropy tuning - use learned ent_coef_target instead
+                        ent_coef = self.model.ent_coef_target if hasattr(self.model, 'ent_coef_target') else 0.1
                     else:
                         ent_coef = float(self.model.ent_coef)
                     
