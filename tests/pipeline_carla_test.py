@@ -487,6 +487,45 @@ class CarlaGymEnv(gym.Env):
                     pass
         
         return self._current_speed_limit
+
+    def _distance_to_nearest_vehicle(self, location) -> float:
+        """Return distance in meters to the nearest live non-ego vehicle."""
+        min_distance = float("inf")
+        try:
+            for actor in self.world.get_actors().filter("vehicle.*"):
+                if self.ego_vehicle is not None and actor.id == self.ego_vehicle.id:
+                    continue
+                actor_location = actor.get_location()
+                distance = location.distance(actor_location)
+                if distance < min_distance:
+                    min_distance = distance
+        except Exception:
+            return float("inf")
+        return min_distance
+
+    def _select_safe_spawn_point(self, min_clearance: float = 8.0):
+        """
+        Pick a spawn point that is not currently occupied by nearby traffic.
+
+        Falls back to the furthest available spawn point if none meet the clearance threshold.
+        """
+        spawn_points = list(self.map.get_spawn_points()) if self.map else []
+        if not spawn_points:
+            return None
+
+        random.shuffle(spawn_points)
+        best_spawn = spawn_points[0]
+        best_clearance = -1.0
+
+        for spawn_point in spawn_points:
+            clearance = self._distance_to_nearest_vehicle(spawn_point.location)
+            if clearance >= min_clearance:
+                return spawn_point
+            if clearance > best_clearance:
+                best_clearance = clearance
+                best_spawn = spawn_point
+
+        return best_spawn
     
     def _generate_waypoints(self):
         """Generate waypoint route starting from ego vehicle location"""
@@ -1107,6 +1146,10 @@ class CarlaGymEnv(gym.Env):
     
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[Dict, Dict]:
         """Reset environment"""
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+
         # Reset counters
         self._episode_step = 0
         self._collision_distance = 100.0
@@ -1147,19 +1190,37 @@ class CarlaGymEnv(gym.Env):
         self.waypoint_completion_ratio = 0.0
         
         # Reset ego vehicle
+        spawn_point = None
         if self.ego_vehicle:
-            spawn_point = random.choice(self.map.get_spawn_points())
-            self.ego_vehicle.set_transform(spawn_point)
-            self.ego_vehicle.set_target_velocity(carla.Vector3D(0, 0, 0))
+            spawn_point = self._select_safe_spawn_point(min_clearance=10.0)
+            if spawn_point is None:
+                raise RuntimeError("No spawn points available during reset")
+
+            try:
+                self.ego_vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
+                self.ego_vehicle.set_target_velocity(carla.Vector3D(0, 0, 0))
+                self.ego_vehicle.set_target_angular_velocity(carla.Vector3D(0, 0, 0))
+                self.ego_vehicle.set_transform(spawn_point)
+            except Exception as e:
+                print(f"[RESET] Failed to reposition ego vehicle cleanly: {e}")
+                raise
         
         # Generate new waypoint route (Phase 2)
         self._generate_waypoints()
         
-        # Get initial observation
-        self.world.tick()
+        # Let physics and sensor streams settle after teleporting the ego vehicle.
+        for _ in range(2):
+            self.world.tick()
         obs = self._get_observation()
-        
-        info = {}
+        self.endpoint_location = self.waypoints[-1] if self.waypoints else None
+
+        info = {
+            "reset_spawn": (
+                spawn_point.location.x,
+                spawn_point.location.y,
+                spawn_point.location.z,
+            ) if self.ego_vehicle else None
+        }
         
         return obs, info
     
@@ -2033,7 +2094,7 @@ def train_sac_agent(
     try:
         model.learn(
             total_timesteps=total_timesteps,
-            log_interval=10,
+            log_interval=1,
             callback=[checkpoint_callback, safety_callback, metrics_callback],
             progress_bar=True
         )

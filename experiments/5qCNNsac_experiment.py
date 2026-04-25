@@ -386,7 +386,7 @@ def train_5q_cnn_sac(
     try:
         model.learn(
             total_timesteps=timesteps,
-            log_interval=10,
+            log_interval=1,
             callback=[checkpoint_callback, safety_callback, trust_callback, metrics_callback],
             progress_bar=True
         )
