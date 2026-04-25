@@ -1,0 +1,12 @@
+[
+  {
+    "episode_num": 1,
+    "model": "2stt",
+    "total_reward": -20729.85121753419,
+    "episode_length": 300,
+    "cbf_enabled": true,
+    "collisions": 0,
+    "waypoints_crossed": 0,
+    "cbf_corrections": 299
+  }
+]
