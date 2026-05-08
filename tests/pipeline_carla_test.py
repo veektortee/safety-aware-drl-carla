@@ -429,8 +429,8 @@ class CarlaGymEnv(gym.Env):
         # Obstacle Detector (RSS) Sensor (Phase 5.3)
         try:
             obstacle_bp = self.blueprint_library.find('sensor.other.obstacle')
-            obstacle_bp.set_attribute('only_physics', 'False')
-            obstacle_bp.set_attribute('distance_to_ad', '50')  # Detection range: 50 meters
+            obstacle_bp.set_attribute('hit_radius', '1')
+            obstacle_bp.set_attribute('distance', '20')  # Detection range: 50 meters
             obstacle_transform = carla.Transform(carla.Location(x=0.8, z=1.7))
             self.obstacle_sensor = self.world.spawn_actor(obstacle_bp, obstacle_transform, attach_to=self.ego_vehicle)
             self.obstacle_sensor.listen(self._on_obstacle_detected)
