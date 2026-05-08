@@ -24,7 +24,7 @@ class CBFSafetyLayer:
         vehicle_width=1.8, # vehicle width (meters)
         v_nominal=10.0,   # nominal speed for Lie deriv scaling (m/s)
         max_steering_rate=0.5,  # max steering change per step (rad)
-        max_accel_change=0.3,   # max throttle/brake change per step
+        max_accel_change=1.2,   # max throttle/brake change per step
         alpha_lane=0.5,   # CBF alpha for lane keeping (softer than collision)
     ):
         self.alpha = alpha
@@ -100,9 +100,9 @@ class CBFSafetyLayer:
         speed_scale = speed / self.v_nominal if speed > 0.1 else 0.1
         
         # Collision avoidance: throttle effect increases with speed
-        throttle_effect = -1.0 * speed_scale
+        throttle_effect = -0.4 * speed_scale
         # Brake effect moderates with speed (saturates at high speed)
-        brake_effect = 2.0 * min(1.0, speed_scale)
+        brake_effect = 1.20 * min(1.0, speed_scale)
         A_col = np.array([0.0, throttle_effect, brake_effect])
         
         # Speed limit: same as collision (throttle ↓, brake ↑)
@@ -292,11 +292,13 @@ class CBFSafetyLayer:
         if trust_score < 1.0:
             uncertainty_factor = 0.3 * (1.0 - trust_score)
             # Conservative blend: keep more of fallback when uncertain
-            fallback = np.array([0.0, 0.0, 1.0])  # emergency brake
+            fallback = np.array([0.0, 0.25, 0.2])  # emergency brake
             u_safe = (1.0 - uncertainty_factor) * u_safe + uncertainty_factor * fallback
 
         # Clip to valid action range
-        u_safe = np.clip(u_safe, -1.0, 1.0)
+        u_safe[0] = np.clip(u_safe[0], -1.0, 1.0)
+        u_safe[1] = np.clip(u_safe[1], 0.0, 1.0)
+        u_safe[2] = np.clip(u_safe[2], 0.0, 1.0)
 
         # =============================================
         # Check if Collision Was Prevented

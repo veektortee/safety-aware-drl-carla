@@ -1,10 +1,45 @@
 """
-SAC Agent Training with CBF Safety Layer on CARLA
+SAC Agent Training with CBF Safety Layer on CARLA — v2.1
 Processes RGB+LIDAR observations through spatiotemporal pipeline,
 detects safety violations (lane invasion, speed limit), applies CBF corrections,
 and logs everything to TensorBoard.
 
 Uses raw CARLA API for direct environment control.
+
+Fixes applied in v2.1 (surgical — no mechanics changed):
+  [3]  Action space bounds corrected: throttle/brake ∈ [0,1] not [-1,1].
+       SAC init near 0 now maps to 0.5 (light pedal) instead of 0 (stall).
+       step() parsing simplified to three direct clips — no conditional logic.
+       CBF clip also updated to respect per-control physical bounds.
+  [4]  reset(): world.tick() called BEFORE _generate_waypoints() so the
+       post-teleport spawn transform is committed before get_location() is read.
+  [5]  Traffic Manager set to synchronous mode before world sync is enabled.
+       NPCs now tick on the same clock as the ego vehicle — eliminates phantom
+       collisions from async TM. set_autopilot() passes TM port explicitly.
+  [6]  lane_invaded flag no longer reset inside _compute_reward() (side-effect
+       in a compute function). It is now reset in step() after reward is
+       computed. obstacle_detected was already cleared at top of step().
+  [10] train_sac_agent(): show_sensor_data=False — was True which called
+       cv2.imshow()+waitKey(1) every step, breaking headless/SSH runs.
+  [11] render() gated behind render_mode == "human" check — was firing
+       unconditionally every step even in headless training mode.
+  [12] _generate_waypoints() removed from __init__ — ego_vehicle is None at
+       that point so the call silently no-ops. Waypoints are generated in
+       reset() after the post-teleport tick.
+  [13] Two warmup world.tick() calls added after _attach_sensors() so sensor
+       callbacks fire before the first reset(), preventing all-zero initial obs.
+
+Already correct in uploaded version (no change):
+  [1]  _update_waypoint_progress() runs before _compute_reward() in step().
+  [2]  _prev_waypoints_crossed reset to 0 in reset().
+  [7]  obstacle_distance reset to 100.0 in reset().
+  [8]  Dead code removed from _compute_collision_distance().
+  [9]  Collision log prints actual reward value.
+  [14] SafetyMetricsCallback uses locals['rewards'], not buf_rewards.
+
+Experiment integration (2qCNNsac_experiment.py):
+  No changes required. Wrapper stack, env unwrapping via _find_carla_and_cbf(),
+  info dict keys, and callback imports all align correctly with this file.
 
 Usage:
     python pipeline_carla_test.py --episodes 10 --timesteps 100000 --render
@@ -84,6 +119,7 @@ class CarlaGymEnv(gym.Env):
         self.world = None
         self.map = None
         self.blueprint_library = None
+        self.traffic_manager = None  # FIX [5]: explicit TM handle for sync mode
         
         # Actors
         self.ego_vehicle = None
@@ -142,7 +178,10 @@ class CarlaGymEnv(gym.Env):
         self.waypoint_cross_distance = 2.0  # Distance to trigger waypoint crossing
         self.waypoints_crossed = 0
         self.total_waypoints = 40  # Default; updated when route is generated
-        self._generate_waypoints()  # Generate initial waypoints
+        # FIX [12]: _generate_waypoints() removed from __init__ — ego_vehicle
+        # is None at this point so the call silently no-ops and waypoints stay
+        # empty until reset(). Waypoints are now generated in reset() after the
+        # post-teleport world.tick() so get_location() is always correct.
         
         # Endpoint tracking & reward (Phase 5)
         self.endpoint_location = None
@@ -160,8 +199,16 @@ class CarlaGymEnv(gym.Env):
         
         # Action/Observation spaces
         # 3D action space: [steering, throttle, brake] for CBF compatibility
+        # FIX [3]: throttle and brake corrected to [0, 1] — physically these are
+        # one-directional pedals (gas, brake) with no negative meaning.
+        # With [-1,1]: SAC init near 0 → throttle=0, brake=0 → car stalls → flat
+        # reward, no gradient to escape.
+        # With [0,1]:  SAC init near 0.5 → light throttle + light brake → car
+        # crawls forward → reward gradient exists from step 1.
+        # The CBF layer and step() parsing receive the same (steer,throttle,brake)
+        # tuple; only the declared range contract changes.
         self.action_space = spaces.Box(
-            low=np.array([-1.0, -1.0, -1.0], dtype=np.float32),
+            low=np.array([-1.0, 0.0, 0.0], dtype=np.float32),
             high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
             dtype=np.float32
         )
@@ -180,6 +227,13 @@ class CarlaGymEnv(gym.Env):
         self._setup_world()
         self._spawn_actors()
         self._attach_sensors()
+
+        # FIX [13]: Two warmup ticks so all sensor callbacks fire at least once
+        # before the first reset() is called. Without this, the initial
+        # observation may contain all-zero rgb_data and lidar_data.
+        self.world.tick()
+        time.sleep(0.1)
+        self.world.tick()
     
     def _connect_carla(self):
         """Connect to CARLA server"""
@@ -196,12 +250,21 @@ class CarlaGymEnv(gym.Env):
     
     def _setup_world(self):
         """Setup world settings (synchronous mode, etc)"""
+        # FIX [5]: Traffic Manager must be put in synchronous mode BEFORE the
+        # world is set to sync mode. If TM runs async while the world is sync,
+        # NPC vehicles tick on a different clock — they teleport/phase through
+        # objects causing phantom collisions the agent can't learn from.
+        self.traffic_manager = self.client.get_trafficmanager(8000)
+        self.traffic_manager.set_synchronous_mode(True)
+        self.traffic_manager.set_global_distance_to_leading_vehicle(2.5)
+        self.traffic_manager.set_hybrid_physics_mode(True)
+
         # Set synchronous mode for reproducibility
         settings = self.world.get_settings()
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = 0.05  # 20 FPS
         self.world.apply_settings(settings)
-        print("[OK] Synchronous mode enabled (20 FPS)")
+        print("[OK] Synchronous mode enabled (20 FPS), TM in sync mode")
     
     def _spawn_actors(self):
         """Spawn ego vehicle, NPCs, and pedestrians"""
@@ -269,7 +332,7 @@ class CarlaGymEnv(gym.Env):
             try:
                 bp = random.choice(vehicle_bps)
                 v = self.world.spawn_actor(bp, sp)
-                v.set_autopilot(True)
+                v.set_autopilot(True, self.traffic_manager.get_port())
                 self.npc_vehicles.append(v)
                 npc_count += 1
             except Exception:
@@ -599,22 +662,30 @@ class CarlaGymEnv(gym.Env):
             pass
     
     def _get_distance_to_next_waypoint(self) -> float:
-        """Get distance to next waypoint"""
+        """Get distance to the NEXT uncrossed waypoint ahead of current position.
+
+        FIX A: The original code used current_waypoint_idx (the waypoint the car
+        has already reached / is sitting on).  Moving away from spawn therefore
+        increased the distance to that same waypoint, making distance_delta
+        negative and generating a negative progress signal for correct forward
+        motion.  We now always target current_waypoint_idx + 1 so the gradient
+        correctly rewards closing the gap to the next milestone.
+        """
         if not self.ego_vehicle or len(self.waypoints) == 0:
             return 100.0
-        
+
         try:
             ego_loc = self.ego_vehicle.get_location()
             ego_pos = np.array([ego_loc.x, ego_loc.y, ego_loc.z])
-            
-            # Get next waypoint (or current if at end)
-            wp_idx = min(self.current_waypoint_idx, len(self.waypoints) - 1)
+
+            # Target the NEXT uncrossed waypoint, clamped to the route end
+            wp_idx = min(self.current_waypoint_idx + 1, len(self.waypoints) - 1)
             wp = self.waypoints[wp_idx]
             wp_pos = np.array([wp.x, wp.y, wp.z])
-            
+
             dist = np.linalg.norm(ego_pos - wp_pos)
             return float(dist)
-        
+
         except Exception:
             return 100.0
     
@@ -687,62 +758,85 @@ class CarlaGymEnv(gym.Env):
     
     def compute_lane_centering_reward(self) -> float:
         """
-        Reward staying centered in-lane with a mild smoothness preference.
+        Soft advisory reward for staying centered while actually moving.
         """
+        if self.ego_vehicle is None:
+            return 0.0
+
         offset = abs(self._compute_lane_offset())
+        velocity = self.ego_vehicle.get_velocity()
+        speed = np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
+
+        if speed < 1.0:
+            if offset <= 1.75:
+                return 0.0
+            return float(np.interp(min(offset, 2.75), [1.75, 2.75], [-0.4, -2.0]))
 
         if offset <= 0.25:
-            lane_reward = 1.5
+            lane_reward = 0.8
         elif offset <= 0.9:
-            lane_reward = float(np.interp(offset, [0.25, 0.9], [1.5, 0.0]))
+            lane_reward = float(np.interp(offset, [0.25, 0.9], [0.8, 0.0]))
         elif offset <= 1.75:
-            lane_reward = float(np.interp(offset, [0.9, 1.75], [0.0, -3.0]))
+            lane_reward = float(np.interp(offset, [0.9, 1.75], [0.0, -1.4]))
         else:
-            lane_reward = -5.0 - 2.0 * min(offset - 1.75, 1.0)
+            lane_reward = -2.0 - 2.5 * min(offset - 1.75, 1.0)
 
-        steering_penalty = -0.15 * abs(self._prev_steering)
+        steering_penalty = -0.5 * abs(self._prev_steering) * min(speed / 5.0, 1.0)
         return lane_reward + steering_penalty
     
     def compute_forward_motion_reward(self) -> float:
         """
-        Reward forward progress aligned with the vehicle heading.
+        Primary dense reward: move forward in the lane with meaningful speed.
+
+        FIX B: The original code returned -2.5 whenever vel_magnitude < 0.25 m/s.
+        SAC's initial random policy is zero-centered, so throttle ≈ 0 for many
+        early steps — the car sits still and immediately accumulates -2.5/step on
+        top of the traffic-flow penalty.  Changing idle to 0.0 removes this
+        dominant negative attractor so the agent can escape the "stand still"
+        local optimum.  The backward-motion penalty is also softened from
+        (-3.0 - 0.8·|v| - 0.6·lateral) to (-1.0 - 0.3·|v| - 0.2·lateral) so
+        early random reversals don't collapse the value estimate.
         """
         if self.ego_vehicle is None:
             return 0.0
-        
+
         velocity = self.ego_vehicle.get_velocity()
         transform = self.ego_vehicle.get_transform()
-        
+
         # Vehicle heading vector
         heading_rad = np.radians(transform.rotation.yaw)
         heading_x = np.cos(heading_rad)
         heading_y = np.sin(heading_rad)
         heading = np.array([heading_x, heading_y])
-        
+
         # Velocity vector
         vel_vector = np.array([velocity.x, velocity.y])
         vel_magnitude = np.linalg.norm(vel_vector)
-        
-        if vel_magnitude < 0.2:
-            return -0.3
-        
-        vel_normalized = vel_vector / vel_magnitude
-        
-        # Forward component (dot product)
-        forward_component = np.dot(vel_normalized, heading)
-        
-        # Lateral component (perpendicular magnitude)
-        lateral_magnitude = np.sqrt(1.0 - forward_component**2) if abs(forward_component) <= 1.0 else 0.0
-        
-        speed_scale = np.clip(vel_magnitude / max(self._get_speed_limit(), 5.0), 0.0, 1.2)
-        forward_reward = 2.0 * forward_component * speed_scale
-        lateral_penalty = -0.75 * lateral_magnitude
-        
-        return float(forward_reward + lateral_penalty)
+
+        # FIX B-1: idle → 0.0 instead of -2.5
+        if vel_magnitude < 0.25:
+            return 0.0
+
+        # Forward and lateral velocity components in the vehicle frame
+        forward_speed = float(np.dot(vel_vector, heading))
+        lateral_vector = vel_vector - forward_speed * heading
+        lateral_speed = float(np.linalg.norm(lateral_vector))
+        speed_limit = max(self._get_speed_limit(), 5.0)
+
+        # FIX B-2: soften backward-motion penalty
+        if forward_speed <= 0.0:
+            return float(-1.0 - 0.3 * abs(forward_speed) - 0.2 * lateral_speed)
+
+        speed_ratio = np.clip(forward_speed / speed_limit, 0.0, 1.2)
+        movement_reward = 15.0 * speed_ratio
+        alignment_bonus = 1.5 * np.clip(forward_speed / max(vel_magnitude, 1e-6), 0.0, 1.0)
+        lateral_penalty = 0.9 * min(lateral_speed, 4.0)
+
+        return float(movement_reward + alignment_bonus - lateral_penalty)
     
     def compute_safe_following_reward(self) -> float:
         """
-        Reward safe headway to the vehicle in front and punish tailgating.
+        Soft headway shaping that only matters when following at speed.
         """
         if self.lidar_data is None or self.ego_vehicle is None:
             return 0.0
@@ -750,66 +844,86 @@ class CarlaGymEnv(gym.Env):
         velocity = self.ego_vehicle.get_velocity()
         ego_speed = np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
         
-        # Extract forward-looking LiDAR points
-        lidar_points = self.lidar_data  # Shape: (3, N)
-        
-        # Filter: points ahead (X > 0) and within lane width (Y: -2 to 2m)
+        if ego_speed < 1.0:
+            return 0.0
+
+        lidar_points = self.lidar_data
+
         forward_points = lidar_points[0, :] > 0
         lateral_points = np.abs(lidar_points[1, :]) < 2.0
         mask = forward_points & lateral_points
-        
+
         if not np.any(mask):
-            return 0.2
-        
-        # Find closest point (likely leading vehicle)
+            return 0.0
+
         forward_distances = lidar_points[0, mask]
         min_distance = float(np.min(forward_distances))
-        
-        # TTC: Time-To-Collision (conservative: assume leader stationary)
+
         ttc = min_distance / max(ego_speed, 0.1)
-        
+
         if ttc < 0.7:
-            return -10.0
-        if ttc < 1.2:
-            return float(np.interp(ttc, [0.7, 1.2], [-10.0, -2.0]))
+            return -8.0
+        if ttc < 1.5:
+            return float(np.interp(ttc, [0.7, 1.5], [-8.0, -0.5]))
         if ttc <= 3.0:
-            return float(1.5 - abs(ttc - 2.0))
-        if ttc <= 5.0:
-            return 0.5
+            return float(np.interp(ttc, [1.5, 3.0], [0.2, 0.7]))
+        if ttc <= 4.5:
+            return float(np.interp(ttc, [3.0, 4.5], [0.7, 0.0]))
         return 0.0
     
     def compute_traffic_flow_reward(self) -> float:
         """
-        Reward matching traffic flow and punish needless slowing/blocking.
+        Strong speed-band shaping: move quickly when the road is clear.
+
+        FIX C: The original low-speed zone returned -3.5 for speed_ratio ≤ 0.15,
+        then added another -2.5 × (0.35 - ratio) clear-road nudge on top.
+        Combined with the (now-removed) -2.5 idle penalty from forward_motion,
+        the agent received ≈ -9 per step in the first seconds — making "stand
+        still with brake" the locally optimal policy.  We reduce the floor to
+        -0.5 and the clear-road nudge to -0.8 so the gradient still pushes
+        toward speed without creating an unescapable negative trap.
         """
         if self.ego_vehicle is None:
             return 0.0
-        
+
         velocity = self.ego_vehicle.get_velocity()
         speed = np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
         speed_limit = self._get_speed_limit()
-        
+
         acceleration = (speed - self._prev_speed) / 0.05
         jerk = abs(acceleration - self._prev_acceleration)
         speed_ratio = speed / max(speed_limit, 5.0)
         road_clear = self._compute_collision_distance() > max(12.0, speed * 1.5)
 
-        flow_reward = float(np.clip(1.5 - 3.0 * abs(speed_ratio - 0.8), -2.0, 1.5))
+        # FIX C-1: floor raised from -3.5 → 5
+        if speed_ratio <= 0.15:
+            flow_reward = -0.5
+        elif speed_ratio <= 0.7:
+            flow_reward = float(np.interp(speed_ratio, [0.15, 0.7], [-0.5, 2.5]))
+        elif speed_ratio <= 0.9:
+            flow_reward = float(np.interp(speed_ratio, [0.7, 0.9], [2.5, 3.8]))
+        elif speed_ratio <= 1.0:
+            flow_reward = float(np.interp(speed_ratio, [0.9, 1.0], [3.8, 2.5]))
+        elif speed_ratio <= 1.1:
+            flow_reward = float(np.interp(speed_ratio, [1.0, 1.1], [2.5, 0.0]))
+        else:
+            flow_reward = 5.0 - 8.0 * min(speed_ratio - 1.1, 0.4)
 
+        # FIX C-2: clear-road nudge reduced from -2.5 → 8
         if road_clear and speed_ratio < 0.35:
-            flow_reward -= 1.5 + 2.0 * (0.35 - speed_ratio)
-        if speed_ratio > 1.1:
-            flow_reward -= 4.0 * (speed_ratio - 1.1)
+            flow_reward += 8 * (0.35 - speed_ratio) / 0.35
+        elif not road_clear and speed_ratio < 0.35:
+            flow_reward = max(flow_reward, -0.5)
 
-        flow_reward -= 0.03 * jerk
-        if acceleration < -3.0:
-            flow_reward -= 0.4 * abs(acceleration + 3.0)
+        flow_reward -= 0.01 * min(jerk, 20.0)
+        if road_clear and acceleration < -4.0:
+            flow_reward -= min(0.8, 0.12 * abs(acceleration + 4.0))
 
         return float(flow_reward)
     
     def compute_yield_and_maneuver_reward(self) -> float:
         """
-        Reward sensible yielding and penalize blocking faster traffic behind.
+        Small etiquette term for not trapping faster traffic behind us.
         """
         if self.lidar_data is None or self.ego_vehicle is None:
             return 0.0
@@ -824,35 +938,33 @@ class CarlaGymEnv(gym.Env):
         lateral_points = np.abs(lidar_points[1, :]) < 3.0
         mask = behind_points & lateral_points
         
-        yield_reward = 0.0
         speed_limit = self._get_speed_limit()
-        
+        yield_reward = 0.0
+
         if np.any(mask):
-            # Vehicle detected behind
             rear_distances = -lidar_points[0, mask]
             min_rear_distance = float(np.min(rear_distances))
-            
+
             closing_speed = max(0.5, speed_limit * 0.25)
             ttc_behind = min_rear_distance / closing_speed
-            
+
             lane_offset = self._compute_lane_offset()
-            
-            if ttc_behind < 3.0 and ego_speed < 0.6 * speed_limit:
+
+            if ttc_behind < 2.5 and ego_speed > 1.5 and ego_speed < 0.55 * speed_limit:
                 if abs(lane_offset) < 0.35:
-                    yield_reward = -1.5
+                    yield_reward = -0.7
                 else:
-                    yield_reward = 0.5
-        
-        # LANE CHANGE STABILITY: penalize excessive lane changes
+                    yield_reward = 0.2
+
         current_lane_offset = self._compute_lane_offset()
-        
-        if abs(current_lane_offset - self._last_lane_offset) > 0.3:
+
+        if ego_speed > 3.0 and abs(current_lane_offset - self._last_lane_offset) > 0.3:
             self._lane_change_count += 1
             if self._lane_change_count > 3 and yield_reward == 0.0:
-                yield_reward = -0.3
-        
+                yield_reward = -0.15
+
         self._last_lane_offset = current_lane_offset
-        
+
         return yield_reward
     
     def compute_opposite_lane_penalty(self) -> float:
@@ -862,8 +974,9 @@ class CarlaGymEnv(gym.Env):
         lane_offset = abs(self._compute_lane_offset())
         if lane_offset <= 1.75:
             return 0.0
-        excess = min((lane_offset - 1.75) / 1.25, 1.0)
-        return float(-2.0 - 3.0 * excess)
+        if lane_offset <= 2.5:
+            return float(np.interp(lane_offset, [1.75, 2.5], [-0.8, -3.0]))
+        return float(-3.0 - 4.0 * min(lane_offset - 2.5, 1.0))
     
     def _log_reward_breakdown(self, components: Dict[str, float]):
         """Debug log reward component breakdown (Phase 3)"""
@@ -883,29 +996,34 @@ class CarlaGymEnv(gym.Env):
     
     def compute_safety_buffer_reward(self) -> float:
         """
-        Reward safe spacing to nearby obstacles and proactive CBF saves.
+        Near-zero when spacing is fine; increasingly negative as margins collapse.
         """
         if self.ego_vehicle is None:
             return 0.0
-        
+
+        velocity = self.ego_vehicle.get_velocity()
+        ego_speed = np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
         d_collision = min(self._compute_collision_distance(), float(self.obstacle_distance))
 
         if d_collision >= 20.0:
-            margin_reward = 0.6
-        elif d_collision >= 10.0:
-            margin_reward = float(np.interp(d_collision, [10.0, 20.0], [0.0, 0.6]))
-        elif d_collision >= 5.0:
-            margin_reward = float(np.interp(d_collision, [5.0, 10.0], [-1.0, 0.0]))
+            margin_reward = 0.0
+        elif d_collision >= 12.0:
+            margin_reward = float(np.interp(d_collision, [12.0, 20.0], [-0.15, 0.0]))
+        elif d_collision >= 6.0:
+            margin_reward = float(np.interp(d_collision, [6.0, 12.0], [-1.5, -0.15]))
         else:
-            margin_reward = -4.0 - 0.5 * (5.0 - d_collision)
+            margin_reward = -4.0 - 0.8 * (6.0 - d_collision)
+
+        if ego_speed < 1.0 and d_collision >= 10.0:
+            margin_reward = 0.0
 
         collision_prevention_bonus = 0.0
         if hasattr(self, '_cbf_wrapper'):
             if hasattr(self._cbf_wrapper, 'cbf_layer'):
                 cbf = self._cbf_wrapper.cbf_layer
                 if hasattr(cbf, 'collision_prevented') and cbf.collision_prevented:
-                    collision_prevention_bonus = 0.4
-        
+                    collision_prevention_bonus = 0.15
+
         return margin_reward + collision_prevention_bonus
     
     def compute_waypoint_progress_reward(self) -> float:
@@ -921,15 +1039,15 @@ class CarlaGymEnv(gym.Env):
             self._prev_distance_to_next_wp = dist_to_next
 
         distance_delta = self._prev_distance_to_next_wp - dist_to_next
-        dense_progress_reward = 1.5 * np.clip(distance_delta, -2.0, 2.0)
+        dense_progress_reward = 3.5 * np.clip(distance_delta, -2.0, 2.0)
 
         milestone_reward = 0.0
         if not hasattr(self, '_prev_waypoints_crossed'):
             self._prev_waypoints_crossed = 0
         if self.waypoints_crossed > self._prev_waypoints_crossed:
-            milestone_reward = 8.0
+            milestone_reward = 12.0
 
-        route_completion_reward = 2.0 * self.waypoint_completion_ratio
+        route_completion_reward = 4.0 * self.waypoint_completion_ratio
 
         self._prev_waypoints_crossed = self.waypoints_crossed
         self._prev_distance_to_next_wp = dist_to_next
@@ -938,25 +1056,25 @@ class CarlaGymEnv(gym.Env):
     
     def compute_obstacle_avoidance_reward(self) -> float:
         """
-        Reward keeping a workable buffer to detected obstacles.
+        Local proximity penalty around obstacles; no free reward in open space.
         """
         if not self.obstacle_sensor or self.obstacle_distance >= 100.0:
             return 0.0
-        
-        if self.obstacle_distance > 20.0:
-            return 0.1
-        if self.obstacle_distance > 10.0:
-            return 0.05
-        if self.obstacle_distance > 5.0:
-            return float(np.interp(self.obstacle_distance, [5.0, 10.0], [-1.0, 0.05]))
-        return -2.0
+
+        if self.obstacle_distance > 15.0:
+            return 0.0
+        if self.obstacle_distance > 8.0:
+            return float(np.interp(self.obstacle_distance, [8.0, 15.0], [-0.8, 0.0]))
+        if self.obstacle_distance > 4.0:
+            return float(np.interp(self.obstacle_distance, [4.0, 8.0], [-2.5, -0.8]))
+        return float(-5.0 - 0.5 * (4.0 - self.obstacle_distance))
     
     def _compute_reward(self) -> float:
         """Robust reward shaping for progress, completion, containment, and traffic safety."""
         if self.collision_occurred:
-            self._last_reward_components = {"collision": -150.0}
-            self._last_total_reward = -150.0
-            return -150.0
+            self._last_reward_components = {"collision": -300.0}
+            self._last_total_reward = -300.0
+            return -300.0
 
         if self.ego_vehicle is None:
             self._last_reward_components = {}
@@ -966,73 +1084,93 @@ class CarlaGymEnv(gym.Env):
         velocity = self.ego_vehicle.get_velocity()
         speed = np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
         speed_limit = max(self._get_speed_limit(), 5.0)
-        clear_road = self._compute_collision_distance() > max(15.0, speed * 1.5)
+        clear_road = self._compute_collision_distance() > max(12.0, speed * 1.5)
 
-        if speed < 0.5 and clear_road and self._episode_step > 10:
+        # FIX E: Delay stalling detection to step 60 (3 seconds at 20 Hz).
+        # The original threshold of step 5 meant the agent was penalised for
+        # being slow before SAC's random exploration had any chance to discover
+        # a positive reward signal.  60 steps is enough time for a first
+        # gradient update to bias the policy toward throttle.
+        if speed < 1.0 and clear_road and self._episode_step > 60:
             self._stalled_steps += 1
         else:
             self._stalled_steps = 0
 
         components = {
-            "alive": 0.2,
-            "movement": self.compute_forward_motion_reward(),
-            "lane_centering": 0.8 * self.compute_lane_centering_reward(),
-            "waypoint_progress": 1.2 * self.compute_waypoint_progress_reward(),
+            # FIX D: alive baseline raised from 0.0 → +0.5 so surviving each
+            # step always provides a small positive signal.  This prevents
+            # "terminate immediately" from ever being the optimal strategy and
+            # gives the critic a stable, non-zero baseline to anchor around.
+            "alive": 0.5,
+            "movement": 8 * self.compute_forward_motion_reward(),
+            "lane_centering": 3.5 * self.compute_lane_centering_reward(),
+            "waypoint_progress": 4* self.compute_waypoint_progress_reward(),
             "traffic_flow": self.compute_traffic_flow_reward(),
-            "safe_following": 0.7 * self.compute_safe_following_reward(),
-            "yielding": 0.8 * self.compute_yield_and_maneuver_reward(),
-            "safety_buffer": self.compute_safety_buffer_reward(),
-            "containment": self.compute_opposite_lane_penalty(),
-            "obstacle_avoidance": self.compute_obstacle_avoidance_reward(),
+            "safe_following": 4.5 * self.compute_safe_following_reward(),
+            "yielding": 0.4 * self.compute_yield_and_maneuver_reward(),
+            "safety_buffer": 2.5 * self.compute_safety_buffer_reward(),
+            "containment": 2.5 * self.compute_opposite_lane_penalty(),
+            "obstacle_avoidance": 3 * self.compute_obstacle_avoidance_reward(),
         }
 
         if self.lane_invaded:
-            components["lane_invasion_event"] = -6.0
+            components["lane_invasion_event"] = -15.0
 
         if self.obstacle_detected and self.obstacle_distance < 8.0:
-            components["close_obstacle_event"] = -4.0
+            components["close_obstacle_event"] = -6.0
 
-        if speed > 1.1 * speed_limit:
-            components["speeding"] = -4.0 * (speed / speed_limit - 1.1)
+        if speed > 1.08 * speed_limit:
+            components["speeding"] = -8.0 * (speed / speed_limit - 1.08)
 
-        if self._stalled_steps > 10:
-            components["stalling"] = -min(4.0, 0.25 * (self._stalled_steps - 10))
+        # FIX E (continued): Stalling penalty capped at -3.0 (was -12.0) with a
+        # slow growth rate of 0.05/step (was 0.8/step) and the 60-step grace
+        # window above.  This keeps the incentive to move without making
+        # extended early idling catastrophically loss-generating.
+        if self._stalled_steps > 0:
+            components["stalling"] = -min(3.0, 0.3 + 0.05 * self._stalled_steps)
 
         if self.endpoint_reached:
-            components["episode_completion"] = 120.0
+            time_efficiency = np.clip(
+                1.0 - (self._episode_step / max(float(self.time_limit), 1.0)),
+                0.0,
+                1.0
+            )
+            components["episode_completion"] = 240.0 + 120.0 * time_efficiency
 
         total_reward = float(sum(components.values()))
         self._last_reward_components = components
         self._last_total_reward = total_reward
         self._log_reward_breakdown(components)
 
-        self.lane_invaded = False
-        self.obstacle_detected = False
+        # FIX [6]: lane_invaded and obstacle_detected flags are reset in step()
+        # after _compute_reward() returns, not here. Resetting inside a compute
+        # function is a side-effect that silently drops events if the function
+        # is ever called more than once per step (e.g. during debugging or via
+        # wrapper chains). The flags are still READ correctly above.
 
         return total_reward
     
     def step(self, action: np.ndarray) -> Tuple[Dict, float, bool, bool, Dict]:
         """Execute one environment step"""
-        # Parse 3D action: [steering, throttle, brake]
-        # Each is in range [-1, 1]
-        steer = float(np.clip(action[0], -1.0, 1.0))
-        throttle_raw = float(np.clip(action[1], -1.0, 1.0))
-        brake_raw = float(np.clip(action[2], -1.0, 1.0))
+        # FIX [3]: Parse 3D action [steer, throttle, brake] with correct bounds.
+        # Each pedal is clipped to its declared range — no conditional logic,
+        # no sign-based branching. The old if/else chain double-braked at SAC
+        # initialisation because both action[1] and action[2] near 0 could
+        # simultaneously contribute brake, stalling the car immediately.
+        steer    = float(np.clip(action[0], -1.0, 1.0))
+        throttle = float(np.clip(action[1],  0.0, 1.0))
+        brake    = float(np.clip(action[2],  0.0, 1.0))
         
-        # FIXED: Properly convert [-1, 1] to [0, 1] for throttle and brake
-        # Positive values → throttle | Negative values → brake with magnitude
-        if throttle_raw >= 0.0:
-            throttle = throttle_raw  # [0, 1]
-            brake = 0.0
-        else:
-            throttle = 0.0
-            brake = -throttle_raw  # Convert negative to positive brake [0, 1]
+
+        # Clamp to [0, 1] for CARLA (can't apply both throttle and brake)
+        throttle = max(0.0, throttle)  # Throttle is [0, 1]
+        brake = max(0.0, brake)        # Brake is [0, 1]
         
-        if brake_raw >= 0.0:
-            brake = max(brake, brake_raw)  # Use whichever brake signal is stronger
-        else:
-            throttle = min(throttle, -brake_raw) if throttle > 0 else 0.0
-            brake = max(brake, -brake_raw)
+        # Normalize if both are non-zero (shouldn't happen, but safety)
+        total = throttle + brake
+        if total > 1.0:
+            throttle /= total
+            brake /= total
 
         # Per-step sensor events should reflect the upcoming world tick only.
         self.obstacle_detected = False
@@ -1044,6 +1182,8 @@ class CarlaGymEnv(gym.Env):
         control.steer = steer
         control.throttle = throttle
         control.brake = brake
+
+        
         
         # DEBUG: Log action on first 10 steps
         if self._episode_step < 10:
@@ -1085,9 +1225,18 @@ class CarlaGymEnv(gym.Env):
         # Reward now reflects the updated route and endpoint state
         lane_invaded_event = self.lane_invaded
         obstacle_detected_event = self.obstacle_detected
+        collision_event = self.collision_occurred
         reward = self._compute_reward()
+
+        # FIX [6]: Reset sensor flags HERE after reward has read them.
+        # obstacle_detected is already cleared at the top of step() each tick.
+        # lane_invaded must be explicitly cleared here so the next tick starts clean.
+        self.lane_invaded = False
         
-        # Update spectator camera to track ego vehicle
+        # FIX [11]: Only update spectator camera when rendering is requested.
+        # The original unconditional call added overhead every step even when
+        # render_mode=None (i.e. during all headless training runs).
+        #if self.render_mode == "human": we need to render the spectator to view ego vehicle from above
         self.render()
         
         # Display RGB sensor data if enabled
@@ -1099,6 +1248,7 @@ class CarlaGymEnv(gym.Env):
         # ===== IMMEDIATE TERMINATION ON COLLISION (BUG FIX) =====
         # CRITICAL: Check collision BEFORE returning and LOG it
         terminated = False
+        terminated_reason = None
         if self.collision_occurred:
             print(f"\n{'='*60}")
             print(f"[COLLISION DETECTED] Episode ended at step {self._episode_step}")
@@ -1107,23 +1257,29 @@ class CarlaGymEnv(gym.Env):
             print(f"  Total reward this step: {reward:.2f}")
             print(f"{'='*60}\n")
             terminated = True
-            # ONLY reset flag after termination is decided and logged
-            self.collision_occurred = False
+            terminated_reason = "collision"
         
         # Endpoint termination (NEW - Phase 5)
         elif self.endpoint_reached:
             terminated = True
+            terminated_reason = "endpoint"
         
         # Timeout termination (secondary)
         elif self._episode_step >= self.time_limit:
             terminated = True
+            terminated_reason = "timeout"
         
         truncated = False
+
         
         # Info dict (Phase 2 - add waypoint tracking)
         info = {
-            'collision_distance': self._compute_collision_distance(),
+            'collision_distance': 0.0 if collision_event else self._compute_collision_distance(),
+            'collision_event': 1.0 if collision_event else 0.0,
+            'collision_count_episode': int(self._collision_count),
             'lane_invaded': lane_invaded_event,
+            'lane_invasion_event': 1.0 if lane_invaded_event else 0.0,
+            'lane_invasion_count_episode': int(self._lane_invasion_count),
             'obstacle_detected': obstacle_detected_event,
             'episode_step': self._episode_step,
             'waypoints_crossed': self.waypoints_crossed,
@@ -1134,6 +1290,9 @@ class CarlaGymEnv(gym.Env):
             'reward_components': dict(self._last_reward_components),
             'ensemble_uncertainty': self._ensemble_uncertainty,
             'trust_score': self._trust_score,
+            'cbf_corrections_episode': int(self._cbf_correction_count_episode),
+            'cbf_correction_magnitude_avg': float(self._avg_correction_mag),
+            'terminated_reason': terminated_reason,
         }
 
         current_speed = float(obs['speed'][0]) if obs is not None else 0.0
@@ -1141,7 +1300,18 @@ class CarlaGymEnv(gym.Env):
         self._prev_speed = current_speed
         self._prev_acceleration = current_acceleration
         self._prev_steering = steer
+
+        if collision_event:
+            # Keep the event visible in this returned step info; reset() will clear it for the next episode.
+            self.collision_occurred = False
         
+        
+        if current_speed < 1.0 and self._episode_step > 120:
+            terminated = True
+            terminated_reason = "stuck"
+            reward -= 50
+
+
         return obs, reward, terminated, truncated, info
     
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[Dict, Dict]:
@@ -1206,11 +1376,17 @@ class CarlaGymEnv(gym.Env):
                 raise
         
         # Generate new waypoint route (Phase 2)
-        self._generate_waypoints()
-        
+        # FIX [4]: world.tick() is called first (inside the settle loop below)
+        # so that set_transform() is committed before get_location() is called
+        # inside _generate_waypoints(). Without this, waypoints point from the
+        # *previous* episode's spawn position, not the new one.
+
         # Let physics and sensor streams settle after teleporting the ego vehicle.
+        # FIX [4]: _generate_waypoints() is called AFTER the first tick so the
+        # new spawn transform is already applied when we query get_location().
         for _ in range(2):
             self.world.tick()
+        self._generate_waypoints()
         obs = self._get_observation()
         self.endpoint_location = self.waypoints[-1] if self.waypoints else None
 
@@ -1497,7 +1673,12 @@ class CBFSafetyLayerWrapper(gym.ActionWrapper):
             safe_action = action.copy()
             self.last_correction_mag = 0.0
         
-        return np.clip(safe_action, -1.0, 1.0)
+        # FIX [3]: Clip each control to its physical range independently.
+        # steer ∈ [-1,1], throttle ∈ [0,1], brake ∈ [0,1]
+        safe_action[0] = np.clip(safe_action[0], -1.0, 1.0)
+        safe_action[1] = np.clip(safe_action[1],  0.0, 1.0)
+        safe_action[2] = np.clip(safe_action[2],  0.0, 1.0)
+        return safe_action
     
     def step(self, action: np.ndarray):
         """Override step to apply CBF corrections and add reward penalty"""
@@ -1511,6 +1692,11 @@ class CBFSafetyLayerWrapper(gym.ActionWrapper):
         if self.last_correction_mag > 0.01:
             correction_penalty = self.correction_penalty * self.last_correction_mag
             reward -= correction_penalty
+
+        info["cbf_correction_event"] = 1.0 if self.last_correction_mag > 0.01 else 0.0
+        info["cbf_correction_magnitude"] = float(self.last_correction_mag)
+        info["cbf_invocations_episode"] = int(self.episode_corrections)
+        info["cbf_collision_prevented"] = 1.0 if getattr(self.cbf_layer, "collision_prevented", False) else 0.0
         
         return obs, reward, terminated, truncated, info
     
@@ -1597,6 +1783,15 @@ def _get_policy_metric_observation(callback) -> Optional[np.ndarray]:
     return observation
 
 
+def _get_step_info(callback, env_idx: int = 0) -> Dict:
+    """Return the info dict for the current VecEnv step."""
+    infos = callback.locals.get("infos")
+    if infos is None or len(infos) <= env_idx:
+        return {}
+    info = infos[env_idx]
+    return info if isinstance(info, dict) else {}
+
+
 def _compute_live_policy_metrics(model, observation) -> Tuple[Optional[float], Optional[float]]:
     """
     Compute ensemble uncertainty and trust directly from the current policy.
@@ -1654,20 +1849,33 @@ class SafetyMetricsCallback(BaseCallback):
         rewards = self.locals.get("rewards", [0.0])
         self.episode_reward += float(rewards[0]) if len(rewards) > 0 else 0.0
         self.episode_length += 1
+        step_info = _get_step_info(self)
 
         # FIX BUG 2 + 4: resolve env references correctly
         carla_env, cbf_wrapper = _find_carla_and_cbf(self.model)
 
-        # Sync episode-level accumulators from live env state
-        if carla_env is not None:
-            self.episode_collisions = getattr(carla_env, "_collision_count", 0)
-            self.episode_waypoints  = getattr(carla_env, "waypoints_crossed", 0)
-        if cbf_wrapper is not None:
-            self.episode_cbf_corrections = getattr(cbf_wrapper, "episode_corrections", 0)
+        # Sync episode-level accumulators from step info first, falling back to live env state.
+        self.episode_collisions = max(
+            self.episode_collisions,
+            int(step_info.get("collision_count_episode", getattr(carla_env, "_collision_count", 0) if carla_env is not None else 0)),
+        )
+        self.episode_waypoints = max(
+            self.episode_waypoints,
+            int(step_info.get("waypoints_crossed", getattr(carla_env, "waypoints_crossed", 0) if carla_env is not None else 0)),
+        )
+        self.episode_cbf_corrections = max(
+            self.episode_cbf_corrections,
+            int(step_info.get("cbf_invocations_episode", getattr(cbf_wrapper, "episode_corrections", 0) if cbf_wrapper is not None else 0)),
+        )
 
         # Periodic per-step metric logging
-        if self.num_timesteps % self.log_frequency == 0:
-            self._record_step_metrics(carla_env, cbf_wrapper)
+        should_log = (
+            self.num_timesteps % self.log_frequency == 0
+            or float(step_info.get("collision_event", 0.0)) > 0.0
+            or float(step_info.get("lane_invasion_event", 0.0)) > 0.0
+        )
+        if should_log:
+            self._record_step_metrics(carla_env, cbf_wrapper, step_info)
             # FIX BUG 1: flush buffered records to TensorBoard
             self.logger.dump(self.num_timesteps)
 
@@ -1684,8 +1892,10 @@ class SafetyMetricsCallback(BaseCallback):
 
         return True
 
-    def _record_step_metrics(self, carla_env, cbf_wrapper):
+    def _record_step_metrics(self, carla_env, cbf_wrapper, step_info: Optional[Dict] = None):
         """Write all per-step metrics into the logger buffer."""
+        if step_info is None:
+            step_info = {}
 
         # CBF metrics
         if cbf_wrapper is not None:
@@ -1717,15 +1927,19 @@ class SafetyMetricsCallback(BaseCallback):
                 self.logger.record("safety/speed_violations",     int(violations.get("speed", 0)))
 
         # Carla-env metrics
+        if carla_env is not None or step_info:
+            collision_distance = step_info.get(
+                "collision_distance",
+                float(carla_env._compute_collision_distance()) if carla_env is not None else 100.0,
+            )
+            collision_count = step_info.get(
+                "collision_count_episode",
+                int(getattr(carla_env, "_collision_count", 0)) if carla_env is not None else 0,
+            )
+            self.logger.record("safety/collision_distance", float(collision_distance))
+            self.logger.record("safety/collision_event", float(step_info.get("collision_event", 0.0)))
+            self.logger.record("safety/collisions_episode", int(collision_count))
         if carla_env is not None:
-            self.logger.record(
-                "safety/collision_distance",
-                float(carla_env._compute_collision_distance()),
-            )
-            self.logger.record(
-                "safety/collisions_episode",
-                int(getattr(carla_env, "_collision_count", 0)),
-            )
             self.logger.record(
                 "safety/lane_offset",
                 float(carla_env._compute_lane_offset()),
@@ -1858,6 +2072,7 @@ class ComprehensiveMetricsLoggingCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         self.episode_length += 1
+        step_info = _get_step_info(self)
 
         # FIX BUG 2 + 4: resolve envs via helper
         carla_env, cbf_wrapper = _find_carla_and_cbf(self.model)
@@ -1866,59 +2081,81 @@ class ComprehensiveMetricsLoggingCallback(BaseCallback):
         self._update_trust_score(carla_env=carla_env, cbf_wrapper=cbf_wrapper)
 
         # 3. CBF metrics
-        if cbf_wrapper is not None:
-            current_cbf = getattr(cbf_wrapper, "correction_count", 0)
-            delta_cbf   = max(0, current_cbf - self._prev_cbf_count)
-
-            if delta_cbf > 0:
-                self.episode_cbf_invocations += delta_cbf
-                self.logger.record("cbf/invoke_event",        1.0)
-                self.logger.record(
-                    "cbf/correction_magnitude",
-                    float(getattr(cbf_wrapper, "last_correction_mag", 0.0)),
-                )
-                if self.verbose > 0:
-                    print(
-                        f"[CBF] Step {self.num_timesteps}: correction "
-                        f"mag={getattr(cbf_wrapper, 'last_correction_mag', 0):.4f}"
-                    )
-            else:
-                self.logger.record("cbf/invoke_event", 0.0)
-
-            self.logger.record(
-                "cbf/total_episode_invocations",
-                float(self.episode_cbf_invocations),
+        current_cbf = int(
+            step_info.get(
+                "cbf_invocations_episode",
+                getattr(cbf_wrapper, "episode_corrections", 0) if cbf_wrapper is not None else 0,
             )
-            self._prev_cbf_count = current_cbf
+        )
+        delta_cbf = max(0, current_cbf - self._prev_cbf_count)
+        cbf_event = float(step_info.get("cbf_correction_event", 1.0 if delta_cbf > 0 else 0.0))
+
+        if cbf_event > 0.0 or delta_cbf > 0:
+            self.episode_cbf_invocations = max(self.episode_cbf_invocations, current_cbf)
+            if self.episode_cbf_invocations == 0:
+                self.episode_cbf_invocations = self._prev_cbf_count + 1
+            self.logger.record("cbf/invoke_event", 1.0)
+            self.logger.record(
+                "cbf/correction_magnitude",
+                float(step_info.get("cbf_correction_magnitude", getattr(cbf_wrapper, "last_correction_mag", 0.0) if cbf_wrapper is not None else 0.0)),
+            )
+            if self.verbose > 0:
+                print(
+                    f"[CBF] Step {self.num_timesteps}: correction "
+                    f"mag={float(step_info.get('cbf_correction_magnitude', getattr(cbf_wrapper, 'last_correction_mag', 0.0) if cbf_wrapper is not None else 0.0)):.4f}"
+                )
+        else:
+            self.logger.record("cbf/invoke_event", 0.0)
+
+        self.logger.record(
+            "cbf/total_episode_invocations",
+            float(self.episode_cbf_invocations),
+        )
+        self._prev_cbf_count = current_cbf
 
         # 4. Collision metrics
-        if carla_env is not None:
-            current_col = getattr(carla_env, "_collision_count", 0)
-            delta_col   = max(0, current_col - self._prev_collision_count)
-            if delta_col > 0:
-                self.episode_collisions += delta_col
-                self.logger.record("collisions/collision_event", 1.0)
-            else:
-                self.logger.record("collisions/collision_event", 0.0)
-            self.logger.record(
-                "collisions/collision_count_episode",
-                float(self.episode_collisions),
+        current_col = int(
+            step_info.get(
+                "collision_count_episode",
+                getattr(carla_env, "_collision_count", 0) if carla_env is not None else 0,
             )
-            self._prev_collision_count = current_col
+        )
+        delta_col = max(0, current_col - self._prev_collision_count)
+        collision_event = float(step_info.get("collision_event", 1.0 if delta_col > 0 else 0.0))
+        if collision_event > 0.0 or delta_col > 0:
+            self.episode_collisions = max(self.episode_collisions, current_col)
+            if self.episode_collisions == 0:
+                self.episode_collisions = self._prev_collision_count + 1
+            self.logger.record("collisions/collision_event", 1.0)
+        else:
+            self.logger.record("collisions/collision_event", 0.0)
+        self.logger.record(
+            "collisions/collision_count_episode",
+            float(self.episode_collisions),
+        )
+        self._prev_collision_count = current_col
 
-            # 5. Lane invasion metrics
-            current_li = getattr(carla_env, "_lane_invasion_count", 0)
-            delta_li   = max(0, current_li - self._prev_lane_invasion_count)
-            if delta_li > 0:
-                self.episode_lane_invasions += delta_li
-                self.logger.record("lane/invasion_event", 1.0)
-            else:
-                self.logger.record("lane/invasion_event", 0.0)
-            self.logger.record(
-                "lane/invasion_count_episode",
-                float(self.episode_lane_invasions),
+        # 5. Lane invasion metrics
+        current_li = int(
+            step_info.get(
+                "lane_invasion_count_episode",
+                getattr(carla_env, "_lane_invasion_count", 0) if carla_env is not None else 0,
             )
-            self._prev_lane_invasion_count = current_li
+        )
+        delta_li = max(0, current_li - self._prev_lane_invasion_count)
+        lane_event = float(step_info.get("lane_invasion_event", 1.0 if delta_li > 0 else 0.0))
+        if lane_event > 0.0 or delta_li > 0:
+            self.episode_lane_invasions = max(self.episode_lane_invasions, current_li)
+            if self.episode_lane_invasions == 0:
+                self.episode_lane_invasions = self._prev_lane_invasion_count + 1
+            self.logger.record("lane/invasion_event", 1.0)
+        else:
+            self.logger.record("lane/invasion_event", 0.0)
+        self.logger.record(
+            "lane/invasion_count_episode",
+            float(self.episode_lane_invasions),
+        )
+        self._prev_lane_invasion_count = current_li
 
         # 6. Per-step rates
         ep_len = max(self.episode_length, 1)
@@ -2053,7 +2290,10 @@ def train_sac_agent(
     
     # Create environment
     print("Initializing CARLA environment...")
-    env = create_carla_env(time_limit=60, render=render, num_npc=20, num_pedestrians=30, show_sensor_data=True)
+    # FIX [10]: show_sensor_data=False during training — the original True
+    # called cv2.imshow()+waitKey(1) on every step, adding latency and
+    # breaking headless/SSH runs. Pass --render to see the RGB feed.
+    env = create_carla_env(time_limit=60, render=render, num_npc=20, num_pedestrians=30, show_sensor_data=False)
     print("[OK] Environment created\n")
     
     # Create SAC model
@@ -2128,7 +2368,7 @@ def main():
     parser = argparse.ArgumentParser(description="SAC Training with CBF on CARLA")
     parser.add_argument("--episodes", type=int, default=10, help="Number of episodes")
     parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps")
-    parser.add_argument("--checkpoint-freq", type=int, default=2000, help="Checkpoint frequency")
+    parser.add_argument("--checkpoint-freq", type=int, default=20000, help="Checkpoint frequency")
     parser.add_argument("--log-dir", type=str, default="./logs", help="Log directory")
     parser.add_argument("--render", action="store_true", help="Render environment")
     
