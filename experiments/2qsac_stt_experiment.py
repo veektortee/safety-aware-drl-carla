@@ -251,6 +251,7 @@ def create_stt_env(
 
 def train_2q_stt_sac(
     timesteps: int = 100000,
+    port: int = 2000,
     log_dir: str = "./logs/2q_stt",
     learning_rate: float = 3e-4,
     batch_size: int = 64,
@@ -396,6 +397,7 @@ if __name__ == "__main__":
         description="2 Q-Network SAC with SpatioTemporal Transformer"
     )
     parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps")
+    parser.add_argument("--port", type=int, default=2000, help="CARLA server port")
     parser.add_argument("--log-dir", type=str, default="./logs/2q_stt", help="Log directory")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
@@ -413,6 +415,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         buffer_size=args.buffer_size,
         render=args.render,
+        port=args.port,
         num_npc=args.num_npc,
         num_pedestrians=args.num_pedestrians
     )

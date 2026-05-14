@@ -505,9 +505,15 @@ class CarlaGymEnv(gym.Env):
         # Prefer physical contact when available, otherwise use the obstacle sensor.
         if self.collision_occurred:
             return 0.0
+        
+        if getattr(self, "obstacle_detected", False):
+            obstacle_distance = float(getattr(self, "obstacle_distance", 100.0))
+            return float(np.clip(obstacle_distance, 0.0, 100.0))
 
-        obstacle_distance = float(getattr(self, "obstacle_distance", 100.0))
-        return float(np.clip(obstacle_distance, 0.0, 100.0))
+        # 3. Default: Path is clear
+        return 100.0
+
+    
     
     def _compute_lane_offset(self) -> float:
         """Compute lane offset from waypoint"""
@@ -803,6 +809,7 @@ class CarlaGymEnv(gym.Env):
         velocity = self.ego_vehicle.get_velocity()
         transform = self.ego_vehicle.get_transform()
 
+
         # Vehicle heading vector
         heading_rad = np.radians(transform.rotation.yaw)
         heading_x = np.cos(heading_rad)
@@ -812,10 +819,18 @@ class CarlaGymEnv(gym.Env):
         # Velocity vector
         vel_vector = np.array([velocity.x, velocity.y])
         vel_magnitude = np.linalg.norm(vel_vector)
-
+        
+        #Velocity magnitude 
+        move=0.0
         # FIX B-1: idle → 0.0 instead of -2.5
         if vel_magnitude < 0.25:
-            return 0.0
+            move=0.0
+
+        if vel_magnitude > 0.1:
+    # A small "existence" bonus for moving forward
+            move+= 0.5 + (vel_magnitude * 0.2) 
+        else:
+            move= 0.0 # Neutral, not negative
 
         # Forward and lateral velocity components in the vehicle frame
         forward_speed = float(np.dot(vel_vector, heading))
@@ -832,7 +847,7 @@ class CarlaGymEnv(gym.Env):
         alignment_bonus = 1.5 * np.clip(forward_speed / max(vel_magnitude, 1e-6), 0.0, 1.0)
         lateral_penalty = 0.9 * min(lateral_speed, 4.0)
 
-        return float(movement_reward + alignment_bonus - lateral_penalty)
+        return float(movement_reward + alignment_bonus - lateral_penalty+move)
     
     def compute_safe_following_reward(self) -> float:
         """
@@ -976,7 +991,7 @@ class CarlaGymEnv(gym.Env):
             return 0.0
         if lane_offset <= 2.5:
             return float(np.interp(lane_offset, [1.75, 2.5], [-0.8, -3.0]))
-        return float(-3.0 - 4.0 * min(lane_offset - 2.5, 1.0))
+        return float(-20.0 - 4.0 * min(lane_offset - 2.5, 1.0))
     
     def _log_reward_breakdown(self, components: Dict[str, float]):
         """Debug log reward component breakdown (Phase 3)"""
@@ -1010,7 +1025,7 @@ class CarlaGymEnv(gym.Env):
         elif d_collision >= 12.0:
             margin_reward = float(np.interp(d_collision, [12.0, 20.0], [-0.15, 0.0]))
         elif d_collision >= 6.0:
-            margin_reward = float(np.interp(d_collision, [6.0, 12.0], [-1.5, -0.15]))
+            margin_reward = float(np.interp(d_collision, [16.0, 22.0], [-1.5, -0.15]))
         else:
             margin_reward = -4.0 - 0.8 * (6.0 - d_collision)
 
@@ -1064,17 +1079,17 @@ class CarlaGymEnv(gym.Env):
         if self.obstacle_distance > 15.0:
             return 0.0
         if self.obstacle_distance > 8.0:
-            return float(np.interp(self.obstacle_distance, [8.0, 15.0], [-0.8, 0.0]))
+            return float(5*(np.interp(self.obstacle_distance, [8.0, 15.0], [-0.8, 0.0])))
         if self.obstacle_distance > 4.0:
-            return float(np.interp(self.obstacle_distance, [4.0, 8.0], [-2.5, -0.8]))
+            return float(7*(np.interp(self.obstacle_distance, [4.0, 8.0], [-2.5, -0.8])))
         return float(-5.0 - 0.5 * (4.0 - self.obstacle_distance))
     
     def _compute_reward(self) -> float:
         """Robust reward shaping for progress, completion, containment, and traffic safety."""
         if self.collision_occurred:
-            self._last_reward_components = {"collision": -300.0}
-            self._last_total_reward = -300.0
-            return -300.0
+            self._last_reward_components = {"collision": -600.0}
+            self._last_total_reward = -600.0
+            return -600.0
 
         if self.ego_vehicle is None:
             self._last_reward_components = {}
@@ -1167,10 +1182,19 @@ class CarlaGymEnv(gym.Env):
         brake = max(0.0, brake)        # Brake is [0, 1]
         
         # Normalize if both are non-zero (shouldn't happen, but safety)
-        total = throttle + brake
-        if total > 1.0:
-            throttle /= total
-            brake /= total
+#        total = throttle + brake
+#       if total > 1.0:
+#          throttle /= total
+#         brake /= total
+
+
+        # FORCE MUTUAL EXCLUSION
+        if throttle > brake:
+            brake = 0.0
+            # Add a small deadzone to help SAC escape the 0.5/0.5 initialization
+            if throttle < 0.1: throttle = 0.0 
+        else:
+            throttle = 0.0
 
         # Per-step sensor events should reflect the upcoming world tick only.
         self.obstacle_detected = False
@@ -1595,7 +1619,7 @@ class CBFSafetyLayerWrapper(gym.ActionWrapper):
     def __init__(self, env: gym.Env, alpha: float = 1.0, use_trust_score: bool = True, correction_penalty: float = 0.003):
         super().__init__(env)
         
-        self.cbf_layer = CBFSafetyLayer(alpha=alpha, d_min=5.0, y_max=1.5, v_max=15.0)
+        self.cbf_layer = CBFSafetyLayer(alpha=alpha, d_min=1.2, y_max=1.9, v_max=25.0)
         self.use_trust_score = use_trust_score
         self.correction_penalty = correction_penalty  # Reduced from 0.01 to 0.003 (Phase 1)
         self.trust_score = 1.0  # Default full trust

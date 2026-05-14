@@ -275,7 +275,7 @@ def create_cnn_env(
     # Base CARLA environment with raw RGB observations
     env = CarlaGymEnv(
         host='localhost',
-        port=2000,
+        port=args.port,
         timeout=10.0,
         time_limit=1000,
         render_mode='human' if render else None,
@@ -316,6 +316,7 @@ def create_cnn_env(
 
 def train_2q_cnn_sac(
     timesteps: int = 1000000,
+    port: int = 2000,
     log_dir: str = "./logs/2q_cnn",
     learning_rate: float = 3e-4,
     batch_size: int = 64,
@@ -479,12 +480,15 @@ if __name__ == "__main__":
     parser.add_argument("--num-pedestrians", type=int, default=200, help="Number of pedestrians")
     parser.add_argument("--disable-advanced-rewards", action="store_true", 
                         help="Disable advanced reward shaping (use base rewards only)")
+    parser.add_argument("--port", type=int, default=2000, help="CARLA server port")
+
     
     args = parser.parse_args()
     
     train_2q_cnn_sac(
         timesteps=args.timesteps,
         log_dir=args.log_dir,
+        port=args.port,
         learning_rate=args.lr,
         batch_size=args.batch_size,
         buffer_size=args.buffer_size,

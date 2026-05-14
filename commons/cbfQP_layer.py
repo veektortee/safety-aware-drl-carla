@@ -18,14 +18,14 @@ class CBFSafetyLayer:
     def __init__(
         self,
         alpha=1.0,
-        d_min=5.0,        # minimum safe distance (meters)
-        y_max=1.5,        # max lane deviation (meters)
+        d_min=2.0,        # minimum safe distance (meters)
+        y_max=1.0,        # max lane deviation (meters)
         v_max=15.0,       # default max speed (m/s)
         vehicle_width=1.8, # vehicle width (meters)
         v_nominal=10.0,   # nominal speed for Lie deriv scaling (m/s)
         max_steering_rate=0.5,  # max steering change per step (rad)
-        max_accel_change=1.2,   # max throttle/brake change per step
-        alpha_lane=0.5,   # CBF alpha for lane keeping (softer than collision)
+        max_accel_change=1.9,   # max throttle/brake change per step
+        alpha_lane=0.8,   # CBF alpha for lane keeping (softer than collision)
     ):
         self.alpha = alpha
         self.alpha_lane = alpha_lane  # Softer correction for lane keeping
