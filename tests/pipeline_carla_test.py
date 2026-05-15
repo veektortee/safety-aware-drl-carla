@@ -991,7 +991,7 @@ class CarlaGymEnv(gym.Env):
             return 0.0
         if lane_offset <= 2.5:
             return float(np.interp(lane_offset, [1.75, 2.5], [-0.8, -3.0]))
-        return float(-20.0 - 4.0 * min(lane_offset - 2.5, 1.0))
+        return float(-3.0 - 4.0 * min(lane_offset - 2.5, 1.0))
     
     def _log_reward_breakdown(self, components: Dict[str, float]):
         """Debug log reward component breakdown (Phase 3)"""
@@ -1187,12 +1187,16 @@ class CarlaGymEnv(gym.Env):
 #          throttle /= total
 #         brake /= total
 
-
         # FORCE MUTUAL EXCLUSION
         if throttle > brake:
             brake = 0.0
             # Add a small deadzone to help SAC escape the 0.5/0.5 initialization
             if throttle < 0.1: throttle = 0.0 
+
+        elif brake > throttle:
+            throttle = 0.0
+            # Add a small deadzone to help SAC escape the 0.5/0.5 initialization
+            if brake < 0.1: brake = 0.0
         else:
             throttle = 0.0
 
