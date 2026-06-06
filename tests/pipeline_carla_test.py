@@ -1193,12 +1193,12 @@ class CarlaGymEnv(gym.Env):
             # Add a small deadzone to help SAC escape the 0.5/0.5 initialization
             if throttle < 0.1: throttle = 0.0 
 
-        elif brake > throttle:
-            throttle = 0.0
-            # Add a small deadzone to help SAC escape the 0.5/0.5 initialization
-            if brake < 0.1: brake = 0.0
         else:
             throttle = 0.0
+            # Add a small deadzone to help SAC escape the 0.5/0.5 initialization
+            if brake < 0.1: brake = 0
+
+        
 
         # Per-step sensor events should reflect the upcoming world tick only.
         self.obstacle_detected = False
@@ -1332,9 +1332,19 @@ class CarlaGymEnv(gym.Env):
         if collision_event:
             # Keep the event visible in this returned step info; reset() will clear it for the next episode.
             self.collision_occurred = False
-        
-        
-        if current_speed < 1.0 and self._episode_step > 120:
+
+
+        # Stuck detection: terminate a non-progressing episode at step 200.
+        # Use PLANAR ground speed (vx, vy only) — the observation 'speed' is the
+        # 3D magnitude (incl. vz), so suspension settling, slope, and in-place
+        # rotation kept it >= 1.0 and the car never registered as stuck even
+        # while going nowhere. Threshold raised 120 -> 200 per spec.
+        if self.ego_vehicle is not None:
+            _v = self.ego_vehicle.get_velocity()
+            planar_speed = float(np.sqrt(_v.x ** 2 + _v.y ** 2))
+        else:
+            planar_speed = current_speed
+        if planar_speed < 1.0 and self._episode_step > 200:
             terminated = True
             terminated_reason = "stuck"
             reward -= 50

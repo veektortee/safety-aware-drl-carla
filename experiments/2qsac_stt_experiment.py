@@ -220,7 +220,7 @@ def create_stt_env(
     # Base CARLA environment
     env = CarlaGymEnv(
         host='localhost',
-        port=2000,
+        port=args.port,
         timeout=10.0,
         time_limit=1000,
         render_mode='human' if render else None,
@@ -251,16 +251,25 @@ def create_stt_env(
 
 def train_2q_stt_sac(
     timesteps: int = 100000,
-    port: int = 2000,
+    port: int = 2004,
     log_dir: str = "./logs/2q_stt",
     learning_rate: float = 3e-4,
     batch_size: int = 64,
     buffer_size: int = 50000,
     render: bool = False,
     num_npc: int = 100,
-    num_pedestrians: int = 30
+    num_pedestrians: int = 30,
+    load_checkpoint: str = None
 ):
-    """Train 2 Q-Network SAC with STT"""
+    """Train 2 Q-Network SAC with STT
+
+    If `load_checkpoint` is given, the SAC weights/optimizer/hyperparameters are
+    restored from that .zip and training CONTINUES (timestep counter and
+    TensorBoard curves are not reset). NOTE: the replay buffer is NOT stored in
+    the checkpoint, so it restarts empty and refills over the first
+    `learning_starts` steps — the learned networks are preserved, so this is a
+    true continuation, not a from-scratch run.
+    """
     
     os.makedirs(log_dir, exist_ok=True)
     tb_dir = os.path.join(log_dir, "tensorboard")
@@ -301,33 +310,57 @@ def train_2q_stt_sac(
         'normalize_images': True,
     }
     
-    print("Creating SAC agent with 2 Q-networks...")
-    model = SAC(
-        'MlpPolicy',
-        env,
-        learning_rate=learning_rate,
-        batch_size=batch_size,
-        buffer_size=buffer_size,
-        gamma=0.99,
-        tau=0.005,
-        train_freq=1,
-        gradient_steps=1,
-        ent_coef='auto',
-        policy_kwargs=policy_kwargs,
-        tensorboard_log=tb_dir,
-        verbose=1
-    )
-    print("[OK] Agent created\n")
+    if load_checkpoint:
+        # Resume: restore weights/optimizer/hyperparameters and continue.
+        if not os.path.isfile(load_checkpoint):
+            raise FileNotFoundError(f"--load-checkpoint not found: {load_checkpoint}")
+        print(f"Resuming SAC agent from checkpoint: {load_checkpoint}")
+        model = SAC.load(load_checkpoint, env=env, tensorboard_log=tb_dir)
+        # Try to restore a matching replay buffer if one was saved alongside the
+        # checkpoint (e.g. '<ckpt>_replay_buffer.pkl'); otherwise warn that the
+        # buffer starts empty.
+        rb_path = load_checkpoint.replace(".zip", "_replay_buffer.pkl")
+        if os.path.isfile(rb_path):
+            model.load_replay_buffer(rb_path)
+            print(f"[OK] Replay buffer restored from {rb_path} "
+                  f"({model.replay_buffer.size()} transitions)")
+        else:
+            print("[WARN] No saved replay buffer found for this checkpoint — the "
+                  "buffer starts EMPTY and refills over the first `learning_starts` "
+                  "steps. Network weights are preserved, so this is still a true "
+                  "continuation, not a from-scratch run.")
+        print("[OK] Agent resumed\n")
+    else:
+        print("Creating SAC agent with 2 Q-networks...")
+        model = SAC(
+            'MlpPolicy',
+            env,
+            learning_rate=learning_rate,
+            batch_size=batch_size,
+            buffer_size=buffer_size,
+            gamma=0.99,
+            tau=0.005,
+            train_freq=1,
+            gradient_steps=1,
+            ent_coef='auto',
+            policy_kwargs=policy_kwargs,
+            tensorboard_log=tb_dir,
+            verbose=1
+        )
+        print("[OK] Agent created\n")
     
     # Setup logger
     logger = configure(tb_dir, ["stdout", "tensorboard"])
     model.set_logger(logger)
     
     # Callbacks
+    # save_replay_buffer=True so future resumes can restore the buffer and avoid
+    # the empty-buffer warm-up. name_prefix unchanged for checkpoint compatibility.
     checkpoint_callback = CheckpointCallback(
         save_freq=10000,
         save_path=ckpt_dir,
-        name_prefix="sac_2q_stt"
+        name_prefix="sac_2q_stt",
+        save_replay_buffer=True
     )
     
     safety_callback = SafetyMetricsCallback(verbose=1)
@@ -341,7 +374,10 @@ def train_2q_stt_sac(
             total_timesteps=timesteps,
             log_interval=1,
             callback=[checkpoint_callback, safety_callback, trust_callback, metrics_callback],
-            progress_bar=True
+            progress_bar=True,
+            # Resume → keep the existing timestep counter and TB curves (true
+            # continuation). Fresh run → start from 0.
+            reset_num_timesteps=not bool(load_checkpoint)
         )
     except KeyboardInterrupt:
         print("\n[INTERRUPT] Training interrupted by user")
@@ -397,7 +433,7 @@ if __name__ == "__main__":
         description="2 Q-Network SAC with SpatioTemporal Transformer"
     )
     parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps")
-    parser.add_argument("--port", type=int, default=2000, help="CARLA server port")
+    parser.add_argument("--port", type=int, default=2004, help="CARLA server port")
     parser.add_argument("--log-dir", type=str, default="./logs/2q_stt", help="Log directory")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
@@ -405,17 +441,22 @@ if __name__ == "__main__":
     parser.add_argument("--render", action="store_true", help="Enable rendering")
     parser.add_argument("--num-npc", type=int, default=200, help="Number of NPC vehicles")
     parser.add_argument("--num-pedestrians", type=int, default=200, help="Number of pedestrians")
-    
+    parser.add_argument("--load-checkpoint", type=str, default=None,
+                        help="Path to a saved SAC .zip to resume training from "
+                             "(true continuation; replay buffer restored if a "
+                             "matching '*_replay_buffer.pkl' sits beside it).")
+
     args = parser.parse_args()
-    
+
     train_2q_stt_sac(
         timesteps=args.timesteps,
         log_dir=args.log_dir,
+        port=args.port,
         learning_rate=args.lr,
         batch_size=args.batch_size,
         buffer_size=args.buffer_size,
         render=args.render,
-        port=args.port,
         num_npc=args.num_npc,
-        num_pedestrians=args.num_pedestrians
+        num_pedestrians=args.num_pedestrians,
+        load_checkpoint=args.load_checkpoint
     )
