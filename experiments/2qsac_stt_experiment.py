@@ -211,7 +211,8 @@ def create_stt_env(
     num_timesteps: int = 100000,
     render: bool = False,
     num_npc: int = 200,
-    num_pedestrians: int = 200
+    num_pedestrians: int = 200,
+    port: int = 2004
 ) -> gym.Env:
     """Create full environment stack: CARLA → STT → CBF → Occlusions"""
     
@@ -220,7 +221,7 @@ def create_stt_env(
     # Base CARLA environment
     env = CarlaGymEnv(
         host='localhost',
-        port=args.port,
+        port=port,
         timeout=10.0,
         time_limit=1000,
         render_mode='human' if render else None,
@@ -297,7 +298,8 @@ def train_2q_stt_sac(
         num_timesteps=timesteps,
         render=render,
         num_npc=num_npc,
-        num_pedestrians=num_pedestrians
+        num_pedestrians=num_pedestrians,
+        port=port
     )
     
     # Policy kwargs with 2 Q-networks

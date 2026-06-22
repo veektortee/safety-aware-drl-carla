@@ -169,7 +169,8 @@ def create_stt_env(
     render: bool = False,
     num_npc: int = 200,
     num_pedestrians: int = 200,
-    encoder_path: Optional[str] = None
+    encoder_path: Optional[str] = None,
+    port: int = 2000
 ) -> gym.Env:
     """Create full environment stack: CARLA → STT → CBF → Occlusions
     
@@ -186,7 +187,7 @@ def create_stt_env(
     # Base CARLA environment
     env = CarlaGymEnv(
         host='localhost',
-        port=2000,
+        port=port,
         timeout=10.0,
         time_limit=1000,
         render_mode='human' if render else None,
@@ -225,10 +226,11 @@ def train_5q_stt_sac(
     render: bool = False,
     num_npc: int = 100,
     num_pedestrians: int = 30,
-    encoder_path: Optional[str] = None
+    encoder_path: Optional[str] = None,
+    load_checkpoint: str = None
 ):
     """Train 5 Q-Network SAC with STT
-    
+
     Args:
         timesteps: Total training timesteps
         log_dir: Directory for logs and checkpoints
@@ -239,6 +241,19 @@ def train_5q_stt_sac(
         num_npc: Number of NPC vehicles
         num_pedestrians: Number of pedestrians
         encoder_path: Path to pretrained encoder checkpoint
+        load_checkpoint: Path to a saved SAC .zip to resume from. When given, the
+            SAC weights/optimizer/hyperparameters are restored and training
+            CONTINUES (timestep counter and TensorBoard curves are not reset).
+            NOTE: the replay buffer is NOT stored in the SAC .zip, so it restarts
+            empty (refilling over the first `learning_starts` steps) unless a
+            matching '*_replay_buffer.pkl' sits beside the checkpoint.
+            CAVEAT (STT-specific): the SpatioTemporal Transformer (st_encoder +
+            stacked_transformer) lives in the environment pipeline, NOT in the
+            SAC .zip, so it is re-initialized on resume. `--encoder-path` can
+            restore the st_encoder if it points at a compatible st_encoder
+            state_dict, but the stacked_transformer is not currently
+            checkpoint-restorable — for a true continuation the transformer
+            effectively re-trains from its init.
     """
     
     os.makedirs(log_dir, exist_ok=True)
@@ -269,7 +284,8 @@ def train_5q_stt_sac(
         render=render,
         num_npc=num_npc,
         num_pedestrians=num_pedestrians,
-        encoder_path=encoder_path
+        encoder_path=encoder_path,
+        port=port
     )
     
     # Policy kwargs with 5 Q-networks (ensemble)
@@ -282,33 +298,63 @@ def train_5q_stt_sac(
         'normalize_images': True,
     }
     
-    print("Creating SAC agent with 5 Q-networks...")
-    model = SAC(
-        'MlpPolicy',
-        env,
-        learning_rate=learning_rate,
-        batch_size=batch_size,
-        buffer_size=buffer_size,
-        gamma=0.99,
-        tau=0.005,
-        train_freq=1,
-        gradient_steps=1,
-        ent_coef='auto',
-        policy_kwargs=policy_kwargs,
-        tensorboard_log=tb_dir,
-        verbose=1
-    )
-    print("[OK] Agent created\n")
+    if load_checkpoint:
+        # Resume: restore weights/optimizer/hyperparameters and continue.
+        if not os.path.isfile(load_checkpoint):
+            raise FileNotFoundError(f"--load-checkpoint not found: {load_checkpoint}")
+        print(f"Resuming SAC agent from checkpoint: {load_checkpoint}")
+        model = SAC.load(load_checkpoint, env=env, tensorboard_log=tb_dir)
+        # Try to restore a matching replay buffer if one was saved alongside the
+        # checkpoint (e.g. '<ckpt>_replay_buffer.pkl'); otherwise warn that the
+        # buffer starts empty.
+        rb_path = load_checkpoint.replace(".zip", "_replay_buffer.pkl")
+        if os.path.isfile(rb_path):
+            model.load_replay_buffer(rb_path)
+            print(f"[OK] Replay buffer restored from {rb_path} "
+                  f"({model.replay_buffer.size()} transitions)")
+        else:
+            print("[WARN] No saved replay buffer found for this checkpoint — the "
+                  "buffer starts EMPTY and refills over the first `learning_starts` "
+                  "steps. Network weights are preserved, so this is still a true "
+                  "continuation, not a from-scratch run.")
+        # The STT (st_encoder + stacked_transformer) is NOT in the SAC .zip — it
+        # lives in the env pipeline and is re-initialized unless --encoder-path
+        # restores the st_encoder. See this function's docstring.
+        print("[WARN] SpatioTemporal Transformer weights are NOT restored from the "
+              "SAC checkpoint; only the SAC actor/critic networks are. Pass "
+              "--encoder-path to restore a compatible st_encoder.")
+        print("[OK] Agent resumed\n")
+    else:
+        print("Creating SAC agent with 5 Q-networks...")
+        model = SAC(
+            'MlpPolicy',
+            env,
+            learning_rate=learning_rate,
+            batch_size=batch_size,
+            buffer_size=buffer_size,
+            gamma=0.99,
+            tau=0.005,
+            train_freq=1,
+            gradient_steps=1,
+            ent_coef='auto',
+            policy_kwargs=policy_kwargs,
+            tensorboard_log=tb_dir,
+            verbose=1
+        )
+        print("[OK] Agent created\n")
     
     # Setup logger
     logger = configure(tb_dir, ["stdout", "tensorboard"])
     model.set_logger(logger)
     
     # Callbacks
+    # save_replay_buffer=True so future resumes can restore the buffer and avoid
+    # the empty-buffer warm-up. name_prefix unchanged for checkpoint compatibility.
     checkpoint_callback = CheckpointCallback(
         save_freq=10000,
         save_path=ckpt_dir,
-        name_prefix="sac_5q_stt"
+        name_prefix="sac_5q_stt",
+        save_replay_buffer=True
     )
     
     transformer_callback = TransformerCheckpointCallback(
@@ -328,7 +374,10 @@ def train_5q_stt_sac(
             total_timesteps=timesteps,
             log_interval=1,
             callback=[checkpoint_callback, transformer_callback, safety_callback, trust_callback, metrics_callback],
-            progress_bar=True
+            progress_bar=True,
+            # Resume → keep the existing timestep counter and TB curves (true
+            # continuation). Fresh run → start from 0.
+            reset_num_timesteps=not bool(load_checkpoint)
         )
     except KeyboardInterrupt:
         print("\n[INTERRUPT] Training interrupted by user")
@@ -405,9 +454,15 @@ if __name__ == "__main__":
         default="pretrained/st_encoder/st_encoder.pth",
         help="Path to pretrained encoder checkpoint (default: pretrained/st_encoder/st_encoder.pth)"
     )
-    
+    parser.add_argument("--load-checkpoint", type=str, default=None,
+                        help="Path to a saved SAC .zip to resume training from "
+                             "(true continuation; replay buffer restored if a "
+                             "matching '*_replay_buffer.pkl' sits beside it). NOTE: "
+                             "the SpatioTemporal Transformer is not in the SAC .zip "
+                             "— use --encoder-path to restore the st_encoder.")
+
     args = parser.parse_args()
-    
+
     train_5q_stt_sac(
         timesteps=args.timesteps,
         port=args.port,
@@ -418,5 +473,6 @@ if __name__ == "__main__":
         render=args.render,
         num_npc=args.num_npc,
         num_pedestrians=args.num_pedestrians,
-        encoder_path=args.encoder_path
+        encoder_path=args.encoder_path,
+        load_checkpoint=args.load_checkpoint
     )

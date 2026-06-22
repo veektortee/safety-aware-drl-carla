@@ -258,7 +258,8 @@ def create_cnn_env(
     num_timesteps: int = 100000,
     render: bool = False,
     num_npc: int = 200,
-    num_pedestrians: int = 200
+    num_pedestrians: int = 200,
+    port: int = 2000
 ) -> gym.Env:
     """Create full environment stack: CARLA → CNN → CBF → Occlusions (no STT)"""
     
@@ -267,7 +268,7 @@ def create_cnn_env(
     # Base CARLA environment with raw RGB observations
     env = CarlaGymEnv(
         host='localhost',
-        port=args.port,
+        port=port,
         timeout=10.0,
         time_limit=1000,
         render_mode='human' if render else None,
@@ -345,7 +346,8 @@ def train_5q_cnn_sac(
         num_timesteps=timesteps,
         render=render,
         num_npc=num_npc,
-        num_pedestrians=num_pedestrians
+        num_pedestrians=num_pedestrians,
+        port=port
     )
     
     # Policy kwargs with 5 Q-networks (ensemble)
