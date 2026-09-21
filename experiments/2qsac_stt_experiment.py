@@ -321,8 +321,13 @@ def train_2q_stt_sac(
         # Try to restore a matching replay buffer if one was saved alongside the
         # checkpoint (e.g. '<ckpt>_replay_buffer.pkl'); otherwise warn that the
         # buffer starts empty.
-        rb_path = load_checkpoint.replace(".zip", "_replay_buffer.pkl")
-        if os.path.isfile(rb_path):
+        import re
+        rb_candidates = [
+            load_checkpoint.replace(".zip", "_replay_buffer.pkl"),
+            re.sub(r"_(\d+)_steps\.zip$", r"_replay_buffer_\1_steps.pkl", load_checkpoint),
+        ]
+        rb_path = next((p for p in rb_candidates if os.path.isfile(p)), None)
+        if rb_path:
             model.load_replay_buffer(rb_path)
             print(f"[OK] Replay buffer restored from {rb_path} "
                   f"({model.replay_buffer.size()} transitions)")
