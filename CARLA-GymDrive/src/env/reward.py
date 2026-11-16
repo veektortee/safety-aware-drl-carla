@@ -113,7 +113,7 @@ class Reward:
         self.current_throttle = vehicle.get_throttle_brake()
         return -lbd if throttle_diff > threshold else 0.0
 
-    def __speed_reward(self, speed, speed_limit=50):
+    def __speed_reward(self, speed, speed_limit=80):
         '''
         This reward function is based on the speed of the vehicle. It aims to keep the vehicle at a good speed while preventing it from going over the speed limit. The reward is calculated as follows:
         {

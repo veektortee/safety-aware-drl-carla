@@ -32,7 +32,14 @@ from stable_baselines3.common.logger import configure
 
 import carla
 
-from tests.pipeline_carla_test import CarlaGymEnv, PipelineObservationWrapper, CBFSafetyLayerWrapper
+from tests.pipeline_carla_test import (
+    CarlaGymEnv, 
+    PipelineObservationWrapper,
+    CBFSafetyLayerWrapper,
+    ComprehensiveMetricsLoggingCallback,
+    PolicyTrustScoreCallback,
+    SafetyMetricsCallback,
+)
 from experiments.occlusions import OcclusionStrategy
 from experiments.waypoint_logger import WaypointContextLogger
 
@@ -157,113 +164,13 @@ class TransformerCheckpointCallback(BaseCallback):
         return True
 
 
-class SafetyMetricsCallback(BaseCallback):
-    """Log safety metrics to TensorBoard"""
-    
-    def __init__(self, verbose=0):
-        super().__init__(verbose)
-        self.collision_count = 0
-        self.lane_invasion_count = 0
-    
-    def _on_step(self) -> bool:
-        # Log metrics every 100 steps
-        if self.num_timesteps % 100 == 0:
-            try:
-                env = self.training_env.envs[0].unwrapped
-                if hasattr(env, 'safety_metrics'):
-                    metrics = env.safety_metrics
-                    # Collision tracking (Phase 5)
-                    self.logger.record("safety/collisions_episode", metrics.get('collisions', 0))
-                    self.logger.record("safety/lane_invasions", metrics.get('lane_invasions', 0))
-                    # CBF corrections - per-episode (Phase 5)
-                    self.logger.record("safety/cbf_corrections_episode", metrics.get('cbf_corrections_episode', 0))
-                    self.logger.record("safety/cbf_correction_magnitude", metrics.get('cbf_correction_magnitude', 0.0))
-                    # Waypoint completion - normalized 0-1 (Phase 5)
-                    self.logger.record("navigation/waypoint_completion_ratio", metrics.get('waypoint_completion', 0.0))
-                    self.logger.record("navigation/waypoints_crossed", metrics.get('waypoints_crossed', 0))
-                    self.logger.record("navigation/total_waypoints", metrics.get('total_waypoints', 0))
-                    # Endpoint detection (Phase 5)
-                    self.logger.record("navigation/endpoint_distance", metrics.get('endpoint_distance', 9999.0))
-                    self.logger.record("navigation/endpoint_reached", metrics.get('endpoint_reached', 0.0))
-            except:
-                pass
-        
-        return True
-
-
-class TrustScoreCallback(BaseCallback):
-    """Compute policy trust score from entropy and pass to CBF layer"""
-    
-    def __init__(self, update_freq: int = 100, verbose: int = 0):
-        super().__init__(verbose)
-        self.update_freq = update_freq
-        self.current_trust = 1.0
-    
-    def _on_step(self) -> bool:
-        # Update trust score periodically
-        if self.num_timesteps % self.update_freq == 0:
-            try:
-                # Compute policy entropy (higher entropy = less confident)
-                if hasattr(self.model, 'ent_coef'):
-                    # SAC's entropy coefficient (auto-adjusted by algorithm)
-                    if isinstance(self.model.ent_coef, torch.Tensor):
-                        ent_coef = self.model.ent_coef.detach().cpu().item()
-                    elif isinstance(self.model.ent_coef, str) and self.model.ent_coef == 'auto':
-                        # Auto entropy tuning - use learned ent_coef_target instead
-                        ent_coef = self.model.ent_coef_target if hasattr(self.model, 'ent_coef_target') else 0.1
-                    else:
-                        ent_coef = float(self.model.ent_coef)
-                    
-                    # Map entropy coef to trust: lower entropy = higher trust
-                    # ent_coef range typically [0.01, 0.5], map to trust [0.0, 1.0]
-                    self.current_trust = 1.0 - np.clip(ent_coef * 2.0, 0.0, 1.0)
-                else:
-                    self.current_trust = 0.8  # Default moderate trust
-                
-                # Find CBFSafetyLayerWrapper in environment stack
-                env = self.training_env
-                cbf_wrapper = None
-                
-                # For VecEnv (vectorized environments)
-                if hasattr(env, 'envs'):
-                    for single_env in env.envs:
-                        current = single_env
-                        while hasattr(current, 'env'):
-                            if hasattr(current, 'set_trust_score'):
-                                cbf_wrapper = current
-                                break
-                            current = current.env
-                        if cbf_wrapper:
-                            break
-                else:
-                    # Single environment
-                    current = env
-                    while hasattr(current, 'env'):
-                        if hasattr(current, 'set_trust_score'):
-                            cbf_wrapper = current
-                            break
-                        current = current.env
-                
-                # Update CBF wrapper if found
-                if cbf_wrapper is not None:
-                    cbf_wrapper.set_trust_score(self.current_trust)
-                    if self.verbose > 0 and self.num_timesteps % (self.update_freq * 10) == 0:
-                        self.logger.record("cbf/trust_score", self.current_trust)
-                        self.logger.record("policy/entropy_coef", ent_coef if 'ent_coef' in locals() else 0.0)
-            
-            except Exception as e:
-                if self.verbose > 0:
-                    print(f"[TRUST] Error updating trust score: {e}")
-        
-        return True
-
-
 def create_stt_env(
     num_timesteps: int = 100000,
     render: bool = False,
     num_npc: int = 200,
     num_pedestrians: int = 200,
-    encoder_path: Optional[str] = None
+    encoder_path: Optional[str] = None,
+    port: int = 2000
 ) -> gym.Env:
     """Create full environment stack: CARLA → STT → CBF → Occlusions
     
@@ -280,7 +187,7 @@ def create_stt_env(
     # Base CARLA environment
     env = CarlaGymEnv(
         host='localhost',
-        port=2000,
+        port=port,
         timeout=10.0,
         time_limit=1000,
         render_mode='human' if render else None,
@@ -311,6 +218,7 @@ def create_stt_env(
 
 def train_5q_stt_sac(
     timesteps: int = 100000,
+    port: int = 2000,
     log_dir: str = "./logs/5q_stt",
     learning_rate: float = 3e-4,
     batch_size: int = 64,
@@ -318,10 +226,11 @@ def train_5q_stt_sac(
     render: bool = False,
     num_npc: int = 100,
     num_pedestrians: int = 30,
-    encoder_path: Optional[str] = None
+    encoder_path: Optional[str] = None,
+    load_checkpoint: str = None
 ):
     """Train 5 Q-Network SAC with STT
-    
+
     Args:
         timesteps: Total training timesteps
         log_dir: Directory for logs and checkpoints
@@ -332,6 +241,19 @@ def train_5q_stt_sac(
         num_npc: Number of NPC vehicles
         num_pedestrians: Number of pedestrians
         encoder_path: Path to pretrained encoder checkpoint
+        load_checkpoint: Path to a saved SAC .zip to resume from. When given, the
+            SAC weights/optimizer/hyperparameters are restored and training
+            CONTINUES (timestep counter and TensorBoard curves are not reset).
+            NOTE: the replay buffer is NOT stored in the SAC .zip, so it restarts
+            empty (refilling over the first `learning_starts` steps) unless a
+            matching '*_replay_buffer.pkl' sits beside the checkpoint.
+            CAVEAT (STT-specific): the SpatioTemporal Transformer (st_encoder +
+            stacked_transformer) lives in the environment pipeline, NOT in the
+            SAC .zip, so it is re-initialized on resume. `--encoder-path` can
+            restore the st_encoder if it points at a compatible st_encoder
+            state_dict, but the stacked_transformer is not currently
+            checkpoint-restorable — for a true continuation the transformer
+            effectively re-trains from its init.
     """
     
     os.makedirs(log_dir, exist_ok=True)
@@ -362,7 +284,8 @@ def train_5q_stt_sac(
         render=render,
         num_npc=num_npc,
         num_pedestrians=num_pedestrians,
-        encoder_path=encoder_path
+        encoder_path=encoder_path,
+        port=port
     )
     
     # Policy kwargs with 5 Q-networks (ensemble)
@@ -375,33 +298,68 @@ def train_5q_stt_sac(
         'normalize_images': True,
     }
     
-    print("Creating SAC agent with 5 Q-networks...")
-    model = SAC(
-        'MlpPolicy',
-        env,
-        learning_rate=learning_rate,
-        batch_size=batch_size,
-        buffer_size=buffer_size,
-        gamma=0.99,
-        tau=0.005,
-        train_freq=1,
-        gradient_steps=1,
-        ent_coef='auto',
-        policy_kwargs=policy_kwargs,
-        tensorboard_log=tb_dir,
-        verbose=1
-    )
-    print("[OK] Agent created\n")
+    if load_checkpoint:
+        # Resume: restore weights/optimizer/hyperparameters and continue.
+        if not os.path.isfile(load_checkpoint):
+            raise FileNotFoundError(f"--load-checkpoint not found: {load_checkpoint}")
+        print(f"Resuming SAC agent from checkpoint: {load_checkpoint}")
+        model = SAC.load(load_checkpoint, env=env, tensorboard_log=tb_dir)
+        # Try to restore a matching replay buffer if one was saved alongside the
+        # checkpoint (e.g. '<ckpt>_replay_buffer.pkl'); otherwise warn that the
+        # buffer starts empty.
+        import re
+        rb_candidates = [
+            load_checkpoint.replace(".zip", "_replay_buffer.pkl"),
+            re.sub(r"_(\d+)_steps\.zip$", r"_replay_buffer_\1_steps.pkl", load_checkpoint),
+        ]
+        rb_path = next((p for p in rb_candidates if os.path.isfile(p)), None)
+        if rb_path:
+            model.load_replay_buffer(rb_path)
+            print(f"[OK] Replay buffer restored from {rb_path} "
+                  f"({model.replay_buffer.size()} transitions)")
+        else:
+            print("[WARN] No saved replay buffer found for this checkpoint — the "
+                  "buffer starts EMPTY and refills over the first `learning_starts` "
+                  "steps. Network weights are preserved, so this is still a true "
+                  "continuation, not a from-scratch run.")
+        # The STT (st_encoder + stacked_transformer) is NOT in the SAC .zip — it
+        # lives in the env pipeline and is re-initialized unless --encoder-path
+        # restores the st_encoder. See this function's docstring.
+        print("[WARN] SpatioTemporal Transformer weights are NOT restored from the "
+              "SAC checkpoint; only the SAC actor/critic networks are. Pass "
+              "--encoder-path to restore a compatible st_encoder.")
+        print("[OK] Agent resumed\n")
+    else:
+        print("Creating SAC agent with 5 Q-networks...")
+        model = SAC(
+            'MlpPolicy',
+            env,
+            learning_rate=learning_rate,
+            batch_size=batch_size,
+            buffer_size=buffer_size,
+            gamma=0.99,
+            tau=0.005,
+            train_freq=1,
+            gradient_steps=1,
+            ent_coef='auto',
+            policy_kwargs=policy_kwargs,
+            tensorboard_log=tb_dir,
+            verbose=1
+        )
+        print("[OK] Agent created\n")
     
     # Setup logger
     logger = configure(tb_dir, ["stdout", "tensorboard"])
     model.set_logger(logger)
     
     # Callbacks
+    # save_replay_buffer=True so future resumes can restore the buffer and avoid
+    # the empty-buffer warm-up. name_prefix unchanged for checkpoint compatibility.
     checkpoint_callback = CheckpointCallback(
         save_freq=10000,
         save_path=ckpt_dir,
-        name_prefix="sac_5q_stt"
+        name_prefix="sac_5q_stt",
+        save_replay_buffer=True
     )
     
     transformer_callback = TransformerCheckpointCallback(
@@ -410,18 +368,21 @@ def train_5q_stt_sac(
         verbose=1
     )
     
-    safety_callback = SafetyMetricsCallback()
-    
-    trust_callback = TrustScoreCallback(update_freq=100, verbose=1)
+    safety_callback = SafetyMetricsCallback(verbose=1)
+    trust_callback = PolicyTrustScoreCallback(update_freq=100, verbose=1)
+    metrics_callback = ComprehensiveMetricsLoggingCallback(verbose=1, log_frequency=1)
     
     # Train
     print(f"Training for {timesteps:,} timesteps...\n")
     try:
         model.learn(
             total_timesteps=timesteps,
-            log_interval=10,
-            callback=[checkpoint_callback, transformer_callback, safety_callback, trust_callback],
-            progress_bar=True
+            log_interval=1,
+            callback=[checkpoint_callback, transformer_callback, safety_callback, trust_callback, metrics_callback],
+            progress_bar=True,
+            # Resume → keep the existing timestep counter and TB curves (true
+            # continuation). Fresh run → start from 0.
+            reset_num_timesteps=not bool(load_checkpoint)
         )
     except KeyboardInterrupt:
         print("\n[INTERRUPT] Training interrupted by user")
@@ -484,6 +445,7 @@ if __name__ == "__main__":
         description="5 Q-Network SAC with SpatioTemporal Transformer"
     )
     parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps")
+    parser.add_argument("--port", type=int, default=2000, help="CARLA server port")
     parser.add_argument("--log-dir", type=str, default="./logs/5q_stt", help="Log directory")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
@@ -497,11 +459,18 @@ if __name__ == "__main__":
         default="pretrained/st_encoder/st_encoder.pth",
         help="Path to pretrained encoder checkpoint (default: pretrained/st_encoder/st_encoder.pth)"
     )
-    
+    parser.add_argument("--load-checkpoint", type=str, default=None,
+                        help="Path to a saved SAC .zip to resume training from "
+                             "(true continuation; replay buffer restored if a "
+                             "matching '*_replay_buffer.pkl' sits beside it). NOTE: "
+                             "the SpatioTemporal Transformer is not in the SAC .zip "
+                             "— use --encoder-path to restore the st_encoder.")
+
     args = parser.parse_args()
-    
+
     train_5q_stt_sac(
         timesteps=args.timesteps,
+        port=args.port,
         log_dir=args.log_dir,
         learning_rate=args.lr,
         batch_size=args.batch_size,
@@ -509,5 +478,6 @@ if __name__ == "__main__":
         render=args.render,
         num_npc=args.num_npc,
         num_pedestrians=args.num_pedestrians,
-        encoder_path=args.encoder_path
+        encoder_path=args.encoder_path,
+        load_checkpoint=args.load_checkpoint
     )

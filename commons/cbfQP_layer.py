@@ -18,14 +18,14 @@ class CBFSafetyLayer:
     def __init__(
         self,
         alpha=1.0,
-        d_min=5.0,        # minimum safe distance (meters)
-        y_max=1.5,        # max lane deviation (meters)
+        d_min=2.0,        # minimum safe distance (meters)
+        y_max=1.0,        # max lane deviation (meters)
         v_max=15.0,       # default max speed (m/s)
         vehicle_width=1.8, # vehicle width (meters)
         v_nominal=10.0,   # nominal speed for Lie deriv scaling (m/s)
         max_steering_rate=0.5,  # max steering change per step (rad)
-        max_accel_change=0.3,   # max throttle/brake change per step
-        alpha_lane=0.5,   # CBF alpha for lane keeping (softer than collision)
+        max_accel_change=1.9,   # max throttle/brake change per step
+        alpha_lane=0.8,   # CBF alpha for lane keeping (softer than collision)
     ):
         self.alpha = alpha
         self.alpha_lane = alpha_lane  # Softer correction for lane keeping
@@ -100,9 +100,9 @@ class CBFSafetyLayer:
         speed_scale = speed / self.v_nominal if speed > 0.1 else 0.1
         
         # Collision avoidance: throttle effect increases with speed
-        throttle_effect = -1.0 * speed_scale
+        throttle_effect = -0.4 * speed_scale
         # Brake effect moderates with speed (saturates at high speed)
-        brake_effect = 2.0 * min(1.0, speed_scale)
+        brake_effect = 1.20 * min(1.0, speed_scale)
         A_col = np.array([0.0, throttle_effect, brake_effect])
         
         # Speed limit: same as collision (throttle ↓, brake ↑)
@@ -292,11 +292,13 @@ class CBFSafetyLayer:
         if trust_score < 1.0:
             uncertainty_factor = 0.3 * (1.0 - trust_score)
             # Conservative blend: keep more of fallback when uncertain
-            fallback = np.array([0.0, 0.0, 1.0])  # emergency brake
+            fallback = np.array([0.0, 0.25, 0.2])  # emergency brake
             u_safe = (1.0 - uncertainty_factor) * u_safe + uncertainty_factor * fallback
 
         # Clip to valid action range
-        u_safe = np.clip(u_safe, -1.0, 1.0)
+        u_safe[0] = np.clip(u_safe[0], -1.0, 1.0)
+        u_safe[1] = np.clip(u_safe[1], 0.0, 1.0)
+        u_safe[2] = np.clip(u_safe[2], 0.0, 1.0)
 
         # =============================================
         # Check if Collision Was Prevented

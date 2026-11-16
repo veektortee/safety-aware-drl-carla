@@ -32,7 +32,12 @@ from stable_baselines3.common.logger import configure
 
 import carla
 
-from tests.pipeline_carla_test import CarlaGymEnv, CBFSafetyLayerWrapper
+from tests.pipeline_carla_test import (
+    CarlaGymEnv,
+    CBFSafetyLayerWrapper,
+    ComprehensiveMetricsLoggingCallback,
+    PolicyTrustScoreCallback,
+)
 from experiments.occlusions import OcclusionStrategy
 from experiments.waypoint_logger import WaypointContextLogger
 
@@ -253,7 +258,8 @@ def create_cnn_env(
     num_timesteps: int = 100000,
     render: bool = False,
     num_npc: int = 200,
-    num_pedestrians: int = 200
+    num_pedestrians: int = 200,
+    port: int = 2000
 ) -> gym.Env:
     """Create full environment stack: CARLA → CNN → CBF → Occlusions (no STT)"""
     
@@ -262,7 +268,7 @@ def create_cnn_env(
     # Base CARLA environment with raw RGB observations
     env = CarlaGymEnv(
         host='localhost',
-        port=2000,
+        port=port,
         timeout=10.0,
         time_limit=1000,
         render_mode='human' if render else None,
@@ -294,15 +300,25 @@ def create_cnn_env(
 
 def train_5q_cnn_sac(
     timesteps: int = 100000,
+    port: int = 2000,
     log_dir: str = "./logs/5q_cnn",
     learning_rate: float = 3e-4,
     batch_size: int = 64,
     buffer_size: int = 50000,
     render: bool = False,
     num_npc: int = 100,
-    num_pedestrians: int = 30
+    num_pedestrians: int = 30,
+    load_checkpoint: str = None
 ):
-    """Train 5 Q-Network SAC with CNN (no STT)"""
+    """Train 5 Q-Network SAC with CNN (no STT)
+
+    If `load_checkpoint` is given, the SAC weights/optimizer/hyperparameters are
+    restored from that .zip and training CONTINUES (timestep counter and
+    TensorBoard curves are not reset). NOTE: the replay buffer is NOT stored in
+    the checkpoint, so it restarts empty and refills over the first
+    `learning_starts` steps — the learned networks are preserved, so this is a
+    true continuation, not a from-scratch run.
+    """
     
     os.makedirs(log_dir, exist_ok=True)
     tb_dir = os.path.join(log_dir, "tensorboard")
@@ -330,7 +346,8 @@ def train_5q_cnn_sac(
         num_timesteps=timesteps,
         render=render,
         num_npc=num_npc,
-        num_pedestrians=num_pedestrians
+        num_pedestrians=num_pedestrians,
+        port=port
     )
     
     # Policy kwargs with 5 Q-networks (ensemble)
@@ -343,47 +360,79 @@ def train_5q_cnn_sac(
         'normalize_images': True,
     }
     
-    print("Creating SAC agent with 5 Q-networks and CNN policy...")
-    model = SAC(
-        'CnnPolicy',             # CNN policy processes raw RGB directly
-        env,
-        learning_rate=learning_rate,
-        batch_size=batch_size,
-        buffer_size=buffer_size,
-        gamma=0.99,
-        tau=0.005,
-        train_freq=1,
-        gradient_steps=1,
-        ent_coef='auto',
-        policy_kwargs=policy_kwargs,
-        tensorboard_log=tb_dir,
-        verbose=1
-    )
-    print("[OK] Agent created\n")
+    if load_checkpoint:
+        # Resume: restore weights/optimizer/hyperparameters and continue.
+        if not os.path.isfile(load_checkpoint):
+            raise FileNotFoundError(f"--load-checkpoint not found: {load_checkpoint}")
+        print(f"Resuming SAC agent from checkpoint: {load_checkpoint}")
+        model = SAC.load(load_checkpoint, env=env, tensorboard_log=tb_dir)
+        # Try to restore a matching replay buffer if one was saved alongside the
+        # checkpoint (e.g. '<ckpt>_replay_buffer.pkl'); otherwise warn that the
+        # buffer starts empty.
+        import re
+        rb_candidates = [
+            load_checkpoint.replace(".zip", "_replay_buffer.pkl"),
+            re.sub(r"_(\d+)_steps\.zip$", r"_replay_buffer_\1_steps.pkl", load_checkpoint),
+        ]
+        rb_path = next((p for p in rb_candidates if os.path.isfile(p)), None)
+        if rb_path:
+            model.load_replay_buffer(rb_path)
+            print(f"[OK] Replay buffer restored from {rb_path} "
+                  f"({model.replay_buffer.size()} transitions)")
+        else:
+            print("[WARN] No saved replay buffer found for this checkpoint — the "
+                  "buffer starts EMPTY and refills over the first `learning_starts` "
+                  "steps. Network weights are preserved, so this is still a true "
+                  "continuation, not a from-scratch run.")
+        print("[OK] Agent resumed\n")
+    else:
+        print("Creating SAC agent with 5 Q-networks and CNN policy...")
+        model = SAC(
+            'CnnPolicy',             # CNN policy processes raw RGB directly
+            env,
+            learning_rate=learning_rate,
+            batch_size=batch_size,
+            buffer_size=buffer_size,
+            gamma=0.99,
+            tau=0.005,
+            train_freq=1,
+            gradient_steps=1,
+            ent_coef='auto',
+            policy_kwargs=policy_kwargs,
+            tensorboard_log=tb_dir,
+            verbose=1
+        )
+        print("[OK] Agent created\n")
     
     # Setup logger
     logger = configure(tb_dir, ["stdout", "tensorboard"])
     model.set_logger(logger)
     
     # Callbacks
+    # save_replay_buffer=True so future resumes can restore the buffer and avoid
+    # the empty-buffer warm-up. name_prefix unchanged for checkpoint compatibility.
     checkpoint_callback = CheckpointCallback(
         save_freq=10000,
         save_path=ckpt_dir,
-        name_prefix="sac_5q_cnn"
+        name_prefix="sac_5q_cnn",
+        save_replay_buffer=True
     )
     
-    safety_callback = SafetyMetricsCallback()
-    
-    trust_callback = TrustScoreCallback(update_freq=100, verbose=1)
+    safety_callback = SafetyMetricsCallback(verbose=1)
+    trust_callback = PolicyTrustScoreCallback(update_freq=100, verbose=1)
+    metrics_callback = ComprehensiveMetricsLoggingCallback(verbose=1)
     
     # Train
     print(f"Training for {timesteps:,} timesteps...\n")
     try:
         model.learn(
             total_timesteps=timesteps,
-            log_interval=10,
-            callback=[checkpoint_callback, safety_callback, trust_callback],
-            progress_bar=True
+            log_interval=1,
+            callback=[checkpoint_callback, safety_callback, trust_callback, metrics_callback],
+            progress_bar=True,
+            # Resume → keep the existing timestep counter and TB curves (true
+            # continuation). Fresh run → start from 0.
+            reset_num_timesteps=not bool(load_checkpoint)
         )
     except KeyboardInterrupt:
         print("\n[INTERRUPT] Training interrupted by user")
@@ -442,6 +491,7 @@ if __name__ == "__main__":
         description="5 Q-Network SAC with CNN Only"
     )
     parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps")
+    parser.add_argument("--port", type=int, default=2000, help="CARLA server port")
     parser.add_argument("--log-dir", type=str, default="./logs/5q_cnn", help="Log directory")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
@@ -449,16 +499,22 @@ if __name__ == "__main__":
     parser.add_argument("--render", action="store_true", help="Enable rendering")
     parser.add_argument("--num-npc", type=int, default=200, help="Number of NPC vehicles")
     parser.add_argument("--num-pedestrians", type=int, default=200, help="Number of pedestrians")
-    
+    parser.add_argument("--load-checkpoint", type=str, default=None,
+                        help="Path to a saved SAC .zip to resume training from "
+                             "(true continuation; replay buffer restored if a "
+                             "matching '*_replay_buffer.pkl' sits beside it).")
+
     args = parser.parse_args()
     
     train_5q_cnn_sac(
         timesteps=args.timesteps,
+        port=args.port,
         log_dir=args.log_dir,
         learning_rate=args.lr,
         batch_size=args.batch_size,
         buffer_size=args.buffer_size,
         render=args.render,
         num_npc=args.num_npc,
-        num_pedestrians=args.num_pedestrians
+        num_pedestrians=args.num_pedestrians,
+        load_checkpoint=args.load_checkpoint
     )

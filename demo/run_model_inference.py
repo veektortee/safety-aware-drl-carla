@@ -13,7 +13,13 @@ Supported Model Variants:
 Usage:
     python demo/run_model_inference.py --model 5cnn --episodes 3 --render
     python demo/run_model_inference.py --model 2stt --episodes 5 --render --no-cbf
+    python demo/run_model_inference.py --model 2stt --episodes 3 --no-trust
     python demo/run_model_inference.py --list-models
+
+When the CBF layer is enabled, the critic-ensemble trust score is computed live
+from the loaded model at every step (trust = exp(-lambda * Var_k[Q_k])) and fed
+to the safety layer, mirroring the training-time PolicyTrustScoreCallback.
+Disable with --no-trust to run the CBF with a fixed trust of 1.0.
 """
 
 import os
@@ -33,6 +39,7 @@ except ImportError:
     print("ERROR: CARLA module not found. Install via CARLA PythonAPI")
     sys.exit(1)
 
+import torch as th
 from stable_baselines3 import SAC
 import gymnasium as gym
 from tests.pipeline_carla_test import (
@@ -62,9 +69,12 @@ class ModelInferenceEngine:
         checkpoint_dir: str = None,
         use_cuda: bool = True,
         use_cbf: bool = True,
+        use_trust: bool = True,
     ):
         """Initialize inference engine"""
         self.model_name = model_name
+        self.use_trust = use_trust
+        self.trust_scores = []
         
         # Fix checkpoint path - handle both relative and absolute paths
         if checkpoint_dir is None:
@@ -176,10 +186,33 @@ class ModelInferenceEngine:
         
         # Optionally add CBF safety layer
         if self.use_cbf:
-            print("[SETUP] Adding CBF Safety Layer...")
-            env = CBFSafetyLayerWrapper(env, alpha=1.0, use_trust_score=False)
-        
+            print(f"[SETUP] Adding CBF Safety Layer (trust modulation: {self.use_trust})...")
+            env = CBFSafetyLayerWrapper(env, alpha=1.0, use_trust_score=self.use_trust)
+
         return env
+
+    def _update_trust_score(self, obs) -> Optional[float]:
+        """Compute ensemble trust from the loaded model and push it to the CBF layer.
+
+        Mirrors the training-time PolicyTrustScoreCallback: evaluate the
+        deterministic actor action under the K-critic ensemble, take the
+        variance across critics, and map it to trust = exp(-lambda * variance).
+        """
+        if not (self.use_cbf and self.use_trust):
+            return None
+        try:
+            obs_tensor, _ = self.model.policy.obs_to_tensor(obs)
+            with th.no_grad():
+                policy_action = self.model.actor(obs_tensor, deterministic=True)
+                _, uncertainty, trust = self.model.critic.predict(obs_tensor, policy_action)
+            trust_value = float(trust.mean().item())
+            if hasattr(self.env, "set_trust_score"):
+                self.env.set_trust_score(trust_value)
+            self.trust_scores.append(trust_value)
+            return trust_value
+        except Exception as e:
+            print(f"[WARN] Trust-score update failed: {e}")
+            return None
     
     def run_inference_episode(self, episode_num: int = 1, verbose: bool = True) -> dict:
         """Run single inference episode"""
@@ -200,13 +233,19 @@ class ModelInferenceEngine:
         truncated = False
         total_reward = 0.0
         step = 0
-        
+        episode_trust = []
+
         # Episode loop
         while not (terminated or truncated):
             try:
                 # Get action from model (deterministic mode)
                 action, _ = self.model.predict(obs, deterministic=True)
-                
+
+                # Live trust score from the critic ensemble -> CBF layer
+                trust_value = self._update_trust_score(obs)
+                if trust_value is not None:
+                    episode_trust.append(trust_value)
+
                 # Step environment
                 obs, reward, terminated, truncated, info = self.env.step(action)
                 
@@ -216,7 +255,8 @@ class ModelInferenceEngine:
                 # Log info every 50 steps
                 if verbose and step % 50 == 0:
                     speed = obs[0] if hasattr(obs, '__len__') else 0  # Approximate
-                    print(f"[Step {step:3d}] Reward: {reward:8.4f} | Total: {total_reward:10.4f}")
+                    trust_str = f" | Trust: {episode_trust[-1]:.3f}" if episode_trust else ""
+                    print(f"[Step {step:3d}] Reward: {reward:8.4f} | Total: {total_reward:10.4f}{trust_str}")
                     
                     # Print environment info if available
                     if hasattr(self.env.unwrapped, 'waypoints_crossed'):
@@ -240,7 +280,12 @@ class ModelInferenceEngine:
             'total_reward': total_reward,
             'episode_length': step,
             'cbf_enabled': self.use_cbf,
+            'trust_enabled': self.use_cbf and self.use_trust,
         }
+        if episode_trust:
+            stats['mean_trust_score'] = float(np.mean(episode_trust))
+            stats['min_trust_score'] = float(np.min(episode_trust))
+            stats['max_trust_score'] = float(np.max(episode_trust))
         
         # Get environment stats if available
         if hasattr(self.env.unwrapped, '_collision_count'):
@@ -262,6 +307,9 @@ class ModelInferenceEngine:
             print(f"Waypoints Crossed: {stats['waypoints_crossed']:10d}")
         if 'cbf_corrections' in stats:
             print(f"CBF Corrections:   {stats['cbf_corrections']:10d}")
+        if 'mean_trust_score' in stats:
+            print(f"Trust (mean/min/max): {stats['mean_trust_score']:.3f} / "
+                  f"{stats['min_trust_score']:.3f} / {stats['max_trust_score']:.3f}")
         print(f"{'='*70}\n")
         
         self.episode_rewards.append(total_reward)
@@ -392,6 +440,12 @@ Examples:
         action="store_true",
         help="Disable CBF safety layer during inference"
     )
+
+    parser.add_argument(
+        "--no-trust",
+        action="store_true",
+        help="Disable live trust-score modulation of the CBF layer (trust fixed at 1.0)"
+    )
     
     parser.add_argument(
         "--cpu",
@@ -419,6 +473,7 @@ Examples:
         checkpoint_dir=args.checkpoint_dir,
         use_cuda=not args.cpu,
         use_cbf=not args.no_cbf,
+        use_trust=not args.no_trust,
     )
     
     # List models if requested

@@ -1,5 +1,6 @@
 #feature_extractor.py
 
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,6 +13,15 @@ import numpy as np
 import cv2
 
 
+# Local ImageNet-pretrained ResNet50 weights, shipped in the repo so we never
+# need to hit download.pytorch.org (which fails behind SSL-inspecting proxies /
+# missing CA bundles). Resolved relative to the project root, not the cwd.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_LOCAL_RESNET50_WEIGHTS = os.path.join(
+    _PROJECT_ROOT, "pretrained", "feature_extractor", "pretrained_resnet50.pth"
+)
+
+
 
 
 class FeatureExtractor(nn.Module):
@@ -22,12 +32,26 @@ class FeatureExtractor(nn.Module):
       - extract_feature_map(frame) -> torch.Tensor (C, H, W) on device (no batch)
       - visualize_feature_map(feature_map, out_size=(H,W)) -> uint8 BGR numpy image for cv2
     """
-    def __init__(self, device="cuda"):
+    def __init__(self, device="cuda", weights_path: str = _LOCAL_RESNET50_WEIGHTS):
         super().__init__()
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
 
-        # Build ResNet50 trunk (remove avgpool + fc)
-        res50 = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        # Build the ResNet50 architecture WITHOUT downloading weights, then load
+        # the local pretrained checkpoint into the full model (its state_dict is
+        # a standard torchvision ResNet50 dict incl. fc., so we load it here
+        # before stripping avgpool/fc into the trunk).
+        res50 = models.resnet50(weights=None)
+        if weights_path and os.path.isfile(weights_path):
+            res50.load_state_dict(self._load_state_dict(weights_path), strict=True)
+            print(f"[FeatureExtractor] Loaded local ResNet50 weights from {weights_path}")
+        else:
+            # Fallback: only reached if the local file is missing. This will try
+            # to download and may fail offline — the local file is the intended
+            # path.
+            print(f"[FeatureExtractor] WARNING: local weights not found at "
+                  f"{weights_path}; falling back to torchvision download.")
+            res50 = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+
         # Keep everything up to the last conv block; children() produces modules in order
         trunk_modules = list(res50.children())[:-2]   # removes AdaptiveAvgPool2d, fc
         self.trunk = nn.Sequential(*trunk_modules).to(self.device)
@@ -105,6 +129,22 @@ class FeatureExtractor(nn.Module):
         self.trunk.to(self.device)
         return super().to(self.device)
 
+    @staticmethod
+    def _load_state_dict(path, map_location="cpu"):
+        """Load a checkpoint file and normalize it to a plain state_dict.
+
+        Accepts a raw state_dict, or a checkpoint wrapper keyed by
+        'model_state' or 'state_dict'.
+        """
+        checkpoint = torch.load(path, map_location=map_location)
+        if isinstance(checkpoint, dict):
+            if "model_state" in checkpoint:
+                return checkpoint["model_state"]
+            if "state_dict" in checkpoint:
+                return checkpoint["state_dict"]
+            return checkpoint
+        raise TypeError("Unsupported checkpoint format: expected dict from torch.load")
+
     def load_pretrained(self, path: str, strict: bool = True):
         """
         Load a pretrained checkpoint into the feature extractor.
@@ -122,18 +162,7 @@ class FeatureExtractor(nn.Module):
             path: filesystem path to the .pth checkpoint
             strict: passed to `load_state_dict` to control strictness
         """
-        checkpoint = torch.load(path, map_location=self.device)
-
-        # Normalize to a state_dict
-        if isinstance(checkpoint, dict):
-            if "model_state" in checkpoint:
-                state_dict = checkpoint["model_state"]
-            elif "state_dict" in checkpoint:
-                state_dict = checkpoint["state_dict"]
-            else:
-                state_dict = checkpoint
-        else:
-            raise TypeError("Unsupported checkpoint format: expected dict from torch.load")
+        state_dict = self._load_state_dict(path, map_location=self.device)
 
         # 1) Try loading directly into trunk
         try:
