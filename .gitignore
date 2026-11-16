@@ -4,6 +4,7 @@ runs/
 checkpoints/
 logs/
 documentations/
+documentation_updates/
 backups/
 pretrained/
 demos/
