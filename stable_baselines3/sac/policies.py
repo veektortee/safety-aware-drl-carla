@@ -36,7 +36,7 @@ class EnsembleCritic(BasePolicy):
     :param activation_fn: Activation function
     :param normalize_images: Whether to normalize images or not
     :param n_critics: Number of critic networks (K)
-    :param trust_lambda: Lambda hyperparameter for trust scoring (exp(-lambda * var))
+    :param trust_lambda: Lambda hyperparameter for trust scoring (exp(-lambda * std(Q) / (|mean(Q)| + 1)))
     :param share_features_extractor: Whether to share or not the features extractor
     """
 
@@ -50,7 +50,7 @@ class EnsembleCritic(BasePolicy):
         activation_fn: type[nn.Module] = nn.ReLU,
         normalize_images: bool = True,
         n_critics: int = 5,
-        trust_lambda: float = 0.01,
+        trust_lambda: float = 2.0,
         share_features_extractor: bool = False,
     ):
         super().__init__(
@@ -95,9 +95,15 @@ class EnsembleCritic(BasePolicy):
         # Calculate Uncertainty: Variance across the ensemble
         # Var(X) = E[X^2] - E[X]^2
         uncertainty = th.var(q_values_ensemble, dim=1, keepdim=True)
-        
-        # Calculate Trust Score: exp(-lambda * uncertainty)
-        trust_score = th.exp(-self.trust_lambda * uncertainty)
+
+        # Trust Score: exp(-lambda * std(Q) / (|mean(Q)| + 1)). The relative spread is meaningful at any
+        # reward scale (exp(-lambda * var) saturated to ~0 or ~1 depending on the Q magnitude). Computed
+        # on detached values: trust is a diagnostic / CBF input, never part of a loss (and sqrt has an
+        # infinite gradient at zero variance).
+        q_detached = q_values_ensemble.detach()
+        std_q = th.sqrt(uncertainty.detach().clamp_min(0.0))
+        mean_q = q_detached.mean(dim=1, keepdim=True)
+        trust_score = th.exp(-self.trust_lambda * std_q / (mean_q.abs() + 1.0))
 
         return q_values_ensemble, uncertainty, trust_score
 
@@ -357,7 +363,7 @@ class SACPolicy(BasePolicy):
         optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[dict[str, Any]] = None,
         n_critics: int = 5,
-        trust_lambda: float = 0.01, # New hyperparameter
+        trust_lambda: float = 2.0, # Trust scoring: exp(-lambda * std(Q) / (|mean(Q)| + 1))
         share_features_extractor: bool = False,
     ):
         super().__init__(
@@ -524,7 +530,7 @@ class CnnPolicy(SACPolicy):
     :param optimizer_kwargs: Additional keyword arguments,
         excluding the learning rate, to pass to the optimizer
     :param n_critics: Number of critic networks to create.
-    :param trust_lambda: Lambda hyperparameter for trust scoring (exp(-lambda * var))
+    :param trust_lambda: Lambda hyperparameter for trust scoring (exp(-lambda * std(Q) / (|mean(Q)| + 1)))
     :param share_features_extractor: Whether to share or not the features extractor
         between the actor and the critic (this saves computation time)
     """
@@ -546,7 +552,7 @@ class CnnPolicy(SACPolicy):
         optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[dict[str, Any]] = None,
         n_critics: int = 5,
-        trust_lambda: float = 0.01,
+        trust_lambda: float = 2.0,
         share_features_extractor: bool = False,
     ):
         super().__init__(
@@ -593,7 +599,7 @@ class MultiInputPolicy(SACPolicy):
     :param optimizer_kwargs: Additional keyword arguments,
         excluding the learning rate, to pass to the optimizer
     :param n_critics: Number of critic networks to create.
-    :param trust_lambda: Lambda hyperparameter for trust scoring (exp(-lambda * var))
+    :param trust_lambda: Lambda hyperparameter for trust scoring (exp(-lambda * std(Q) / (|mean(Q)| + 1)))
     :param share_features_extractor: Whether to share or not the features extractor
         between the actor and the critic (this saves computation time)
     """
@@ -615,7 +621,7 @@ class MultiInputPolicy(SACPolicy):
         optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[dict[str, Any]] = None,
         n_critics: int = 5,
-        trust_lambda: float = 0.01,
+        trust_lambda: float = 2.0,
         share_features_extractor: bool = False,
     ):
         super().__init__(
