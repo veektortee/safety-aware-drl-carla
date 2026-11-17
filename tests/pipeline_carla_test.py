@@ -392,7 +392,7 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
     metadata = {"render_modes": ["human"]}
 
     EGO_BLUEPRINTS = ("vehicle.tesla.model3", "vehicle.audi.a2", "vehicle.dodge.charger", "vehicle.bmw.grandtourer")
-    TM_PORT = 8000
+    TM_PORT_OFFSET = 6000   # Traffic Manager port = CARLA port + 6000 (2000 -> 8000), so parallel runs don't collide
     CAMERA_W = 640
     CAMERA_H = 360
 
@@ -513,7 +513,7 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
 
     def _setup_world(self):
         # TM must be synchronous before the world is, or NPCs tick on a different clock.
-        self.traffic_manager = self.client.get_trafficmanager(self.TM_PORT)
+        self.traffic_manager = self.client.get_trafficmanager(self.port + self.TM_PORT_OFFSET)
         self.traffic_manager.set_synchronous_mode(True)
         self.traffic_manager.set_global_distance_to_leading_vehicle(2.5)
         self.traffic_manager.set_hybrid_physics_mode(True)   # needs an actor with role_name 'hero'

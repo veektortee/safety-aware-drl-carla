@@ -193,20 +193,23 @@ def wait_for_port(port, seconds, name, note):
     return False
 
 
-def carla_command(exe, port, extra_args):
-    """CARLA command line for a VISIBLE window (offscreen / null-render flags are removed)."""
+def carla_command(exe, port, extra_args, headless=False):
+    """CARLA command line: a visible window by default, or off-screen with headless=True
+    (the experiments' own camera windows stay visible either way)."""
+    if headless:
+        return [exe, f"-carla-rpc-port={port}", "-quality-level=Low", "-RenderOffScreen"] + list(extra_args)
     kept = []
     for arg in extra_args:
         if arg.lower().split("=", 1)[0] in HIDDEN_WINDOW_FLAGS:
-            log(f"ignoring CARLA flag {arg}: the simulator window must stay visible")
+            log(f"ignoring CARLA flag {arg}: use --headless for an off-screen server")
             continue
         kept.append(arg)
     return [exe, f"-carla-rpc-port={port}", "-quality-level=Low", "-windowed"] + kept
 
 
-def start_carla(exe, port, extra_args, wait_seconds, name):
-    cmd = carla_command(exe, port, extra_args)
-    log(f"[{name}] starting CARLA on port {port} (visible window)")
+def start_carla(exe, port, extra_args, wait_seconds, name, headless=False):
+    cmd = carla_command(exe, port, extra_args, headless)
+    log(f"[{name}] starting CARLA on port {port} ({'headless' if headless else 'visible window'})")
     proc = subprocess.Popen(cmd)
     if wait_for_port(port, wait_seconds, name, "waiting for CARLA to finish loading..."):
         log(f"[{name}] CARLA is up on port {port}")
@@ -346,7 +349,7 @@ def run_experiment(name, cfg, args, port):
             if args.carla_exe:
                 kill_process_tree(carla_proc)
                 carla_proc = start_carla(args.carla_exe, port, args.carla_arg,
-                                         args.carla_wait, name)
+                                         args.carla_wait, name, args.headless)
                 if STOP.is_set():
                     break
             elif not port_is_open(port):
@@ -440,10 +443,13 @@ def build_parser():
                         help="Seconds between ETA lines (default 120)")
     parser.add_argument("--carla-exe", default=None,
                         help="Path to CarlaUE4.exe. If given, the runner starts and restarts CARLA itself "
-                             "(always in a visible window).")
+                             "(visible window unless --headless).")
+    parser.add_argument("--headless", action="store_true",
+                        help="Start CARLA off-screen (-RenderOffScreen); the experiments' camera windows "
+                             "still open with --render")
     parser.add_argument("--carla-arg", action="append", default=[],
                         help="Extra argument for CARLA; repeat for several "
-                             "(-RenderOffScreen / -nullrhi are ignored)")
+                             "(-RenderOffScreen / -nullrhi are ignored unless --headless)")
     parser.add_argument("--carla-wait", type=float, default=180.0,
                         help="Seconds to wait for CARLA to start answering on its port (default 180)")
     parser.add_argument("--exp-dir", default=None,
