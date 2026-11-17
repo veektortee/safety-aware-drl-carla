@@ -22,7 +22,14 @@ class TransformerBlock(nn.Module):
         # Multi-head self-attention
         x_res = x
         x = self.norm1(x)
-        attn_out, _ = self.attn(x, x, x)
+        if x.shape[1] == 1:
+            # Attention over a single token: the softmax of one score is 1, so the output is exactly
+            # out_proj(value_proj(x)). Same weights and result, a fraction of the kernel launches.
+            e = self.attn.embed_dim
+            v = F.linear(x, self.attn.in_proj_weight[2 * e:], self.attn.in_proj_bias[2 * e:])
+            attn_out = self.attn.out_proj(v)
+        else:
+            attn_out, _ = self.attn(x, x, x, need_weights=False)
         x = x_res + attn_out
 
         # MLP
@@ -159,7 +166,7 @@ class TimeSformerBlock(nn.Module):
         # xt is (Batch*Space, Time, Dim)
         res_t = xt
         xt = self.norm_time(xt)
-        xt, _ = self.attn_time(xt, xt, xt)
+        xt, _ = self.attn_time(xt, xt, xt, need_weights=False)   # fused attention, weights unused
         xt = xt + res_t
         
         # Reshape back to (B, T, S, D)
@@ -172,7 +179,7 @@ class TimeSformerBlock(nn.Module):
         # Apply Attention over Space
         res_s = xs
         xs = self.norm_space(xs)
-        xs, _ = self.attn_space(xs, xs, xs)
+        xs, _ = self.attn_space(xs, xs, xs, need_weights=False)
         xs = xs + res_s
         
         # Reshape back to (B, T, S, D)

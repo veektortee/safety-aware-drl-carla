@@ -330,18 +330,13 @@ class SAC(OffPolicyAlgorithm):
             critic_loss.backward()
             self.critic.optimizer.step()
 
-            # Compute actor loss
-            # Alternative: actor_loss = th.mean(log_prob - qf1_pi)
-            # Min over all critic networks
-            # Compute actor loss
-            if self.use_sde:
-                self.actor.reset_noise()
-            actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
-            log_prob = log_prob.reshape(-1, 1)
-            
-            # Get the ensemble Q-values for the policy action and calculate uncertainty/trust
+            # Compute actor loss with actions_pi / log_prob sampled at the top of this step (as upstream
+            # SB3 does): the actor is unchanged by the entropy and critic updates, so re-running it on the
+            # same batch only cost another features-extractor pass.
+            # Get the ensemble Q-values for the policy action and calculate uncertainty/trust. The critic's
+            # features need no graph here: the actor loss only needs dQ/d(action).
             q_values_ensemble_pi, uncertainty, trust_score = self.critic.ensemble_forward(
-                replay_data.observations, actions_pi
+                replay_data.observations, actions_pi, detach_features=True
             )
             # Min over all K critic networks for the actor loss
             min_qf_pi, _ = th.min(q_values_ensemble_pi, dim=1, keepdim=True)# Standard SAC Actor Loss

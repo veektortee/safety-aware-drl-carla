@@ -78,16 +78,27 @@ class EnsembleCritic(BasePolicy):
 
         return [q_net(q_input) for q_net in self.q_networks]
 
-    def ensemble_forward(self, obs: PyTorchObs, actions: th.Tensor) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+    def ensemble_forward(
+        self, obs: PyTorchObs, actions: th.Tensor, detach_features: bool = False
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         Forward pass that returns all Q-values, uncertainty, and trust score.
 
         :param obs: Current observation
         :param actions: Actions taken by the policy
+        :param detach_features: compute the observation features without a graph. For the actor loss,
+            which only needs dQ/d(action): it skips back-propagating through the critic's features
+            extractor, whose gradients would be discarded anyway (zeroed before the next critic step).
         :return: Q-values (tensor, (batch_size, K)), Uncertainty (tensor), Trust Score (tensor)
         """
         # Get K Q-values, each shape (batch_size, 1)
-        q_values_list = self(obs, actions)
+        if detach_features:
+            with th.no_grad():
+                features = self.extract_features(obs, self.features_extractor)
+            q_input = th.cat([features, actions], dim=1)
+            q_values_list = [q_net(q_input) for q_net in self.q_networks]
+        else:
+            q_values_list = self(obs, actions)
         
         # Stack into shape (batch_size, K)
         q_values_ensemble = th.cat(q_values_list, dim=1)
