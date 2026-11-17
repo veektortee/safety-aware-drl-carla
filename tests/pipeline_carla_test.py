@@ -109,7 +109,8 @@ class RewardConfigV3:
     BLOCKED_TL_GAP_M = 30.0
     BLOCKED_STOP_GAP_M = 10.0
     MIN_EPISODE_STEPS = 600
-    EPISODE_TIME_SPEED_FRAC = 0.4  # per-episode limit = route_length / (0.4 * v_limit) / DT
+    EPISODE_TIME_SPEED_FRAC = 0.4  # per-episode limit = (route_length / (0.4 * v_limit) + LIGHT_WAIT_S) / DT
+    LIGHT_WAIT_S = 60.0            # allowance for legally waiting at red lights (CARLA red phases are long)
 
     # speed limit
     SPEED_LIMIT_MIN_MPS = 5.0
@@ -151,8 +152,9 @@ def clip_speed_limit(limit_kmh: float, cfg=RewardConfigV3) -> float:
 
 
 def episode_step_limit(route_length_m: float, v_limit_mps: float, time_limit: int, cfg=RewardConfigV3) -> int:
-    """clip(int(route_length / (0.4 * v_limit) / DT), 600, time_limit)."""
-    steps = int(route_length_m / (cfg.EPISODE_TIME_SPEED_FRAC * max(float(v_limit_mps), 0.1)) / DT)
+    """clip(int((route_length / (0.4 * v_limit) + LIGHT_WAIT_S) / DT), 600, time_limit)."""
+    drive_s = route_length_m / (cfg.EPISODE_TIME_SPEED_FRAC * max(float(v_limit_mps), 0.1))
+    steps = int((drive_s + cfg.LIGHT_WAIT_S) / DT)
     return int(min(max(steps, cfg.MIN_EPISODE_STEPS), int(time_limit)))
 
 
