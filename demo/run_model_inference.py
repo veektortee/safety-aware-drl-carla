@@ -5,16 +5,16 @@ Demo: watch a trained SAC model drive in CARLA
 Loads a model saved by one of the four experiments and runs deterministic episodes with the SAME
 wrapper stack as training:
 
-    CarlaGymEnv -> CBFSafetyLayerWrapper -> CnnNavObservationWrapper   (CNN models, Dict observation)
-    CarlaGymEnv -> CBFSafetyLayerWrapper -> SttNavObservationWrapper   (STT models, vector observation)
+    CarlaGymEnv -> CBFSafetyLayerWrapper -> CnnNavObservationWrapper   (CNN models: image + nav)
+    CarlaGymEnv -> CBFSafetyLayerWrapper -> SttNavObservationWrapper   (STT models: frame codes + nav)
 
 The variant is detected from the model's observation space. The camera window is shown and the
 spectator follows the car (disable with --no-render). One line is printed per episode.
 
 With the CBF enabled, the critic-ensemble trust score is computed from the loaded model at every
 step and fed to the safety layer, as PolicyTrustScoreCallback does during training (--no-trust
-keeps trust at 1.0). STT models need the run's transformer weights: they are found automatically in
-<log-dir>/checkpoints/transformer/ (or pass --transformer-path).
+keeps trust at 1.0). STT models carry everything in the .zip: the trained transformer is part of the
+policy and the frozen frame projection is stored as model.stt_projection.
 
 A CARLA server must be running on --port.
 
@@ -44,8 +44,7 @@ from stable_baselines3 import SAC
 
 from tests.pipeline_carla_test import CarlaGymEnv, CBFSafetyLayerWrapper, _compute_live_policy_metrics
 from commons.curriculum_stages import FINAL_STAGE, STAGES
-from commons.nav_layout import NAV_DIM
-from commons.obs_wrappers import CnnNavObservationWrapper, SttNavObservationWrapper, find_transformer_checkpoint
+from commons.obs_wrappers import CnnNavObservationWrapper
 
 LEGACY_MODELS = {
     "5cnn": "SAC 5 critics, CNN",
@@ -85,10 +84,12 @@ def build_env(model, args, model_path: str):
     """Same stack as training, chosen from the model's observation space."""
     obs_space = model.observation_space
     is_cnn = isinstance(obs_space, spaces.Dict) and "image" in obs_space.spaces
-    is_stt = isinstance(obs_space, spaces.Box) and len(obs_space.shape) == 1 and obs_space.shape[0] > NAV_DIM
+    is_stt = isinstance(obs_space, spaces.Dict) and "frames" in obs_space.spaces
     if not (is_cnn or is_stt):
-        raise SystemExit(f"[ERROR] {model_path} has observation space {obs_space}; it was trained with the old "
-                         "env (before image+nav observations and [steer, accel] actions) and cannot run here.")
+        raise SystemExit(f"[ERROR] {model_path} has observation space {obs_space}; it was trained with an older "
+                         "env or STT version (vector observation) and cannot run here.")
+    if is_stt and getattr(model, "stt_projection", None) is None:
+        raise SystemExit(f"[ERROR] {model_path} has no stt_projection (saved by the STT experiments)")
     env = CarlaGymEnv(
         host="localhost",
         port=args.port,
@@ -107,16 +108,12 @@ def build_env(model, args, model_path: str):
         env = CnnNavObservationWrapper(env, size=size, occlusion=args.occlusion)
         variant = f"CNN (image {size}x{size} + nav)"
     else:
-        embed_dim = int(obs_space.shape[0]) - NAV_DIM
-        env = SttNavObservationWrapper(env, embed_dim=embed_dim, num_frames=8, occlusion=args.occlusion)
-        tpath = args.transformer_path or find_transformer_checkpoint(model_path)
-        if tpath:
-            env.load_transformer(tpath)
-            print(f"[SETUP] transformer weights: {tpath}")
-        else:
-            print("[SETUP] WARNING: no transformer_checkpoint_*.pth found for this model; the STT has new "
-                  "weights and the policy will see different embeddings than in training (use --transformer-path)")
-        variant = f"STT (embedding {embed_dim} + nav)"
+        from commons.stt import SttNavObservationWrapper, projection_summary
+
+        frames, channels = obs_space.spaces["frames"].shape[:2]
+        env = SttNavObservationWrapper(env, num_frames=frames, channels=channels, occlusion=args.occlusion)
+        env.set_projection(model.stt_projection)
+        variant = f"STT ({frames} frames, {projection_summary(model.stt_projection)})"
     return env, variant
 
 
@@ -184,7 +181,6 @@ def main(argv=None) -> int:
     parser.add_argument("--occlusion", type=str, default="none",
                         choices=["none", "mixed", "black_bars", "white_noise"],
                         help="Camera occlusions as in training (default none)")
-    parser.add_argument("--transformer-path", type=str, default=None, help="STT weights (auto-detected if omitted)")
     parser.add_argument("--no-cbf", action="store_true", help="Run without the CBF safety layer")
     parser.add_argument("--no-trust", action="store_true", help="CBF with a fixed trust of 1.0")
     parser.add_argument("--no-render", action="store_true", help="No camera window / spectator follow")

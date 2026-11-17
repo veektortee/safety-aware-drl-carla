@@ -22,7 +22,7 @@ CarlaUE4.exe -fps=20 --carla-port=2000      # Windows
 Four experiment scripts in `experiments/`, named `<N>q<Arch>sac_experiment.py` where `N` ∈ {2,5} is the critic-ensemble size and `Arch` ∈ {CNN, stt}:
 
 - `2qCNNsac_experiment.py`, `5qCNNsac_experiment.py` — 84×84 camera + 26-dim nav vector → `MultiInputPolicy`
-- `2qsac_stt_experiment.py`, `5qsac_stt_experiment.py` — ResNet50 → SpatioTemporal Transformer embedding (512) + nav vector → `MlpPolicy`
+- `2qsac_stt_experiment.py`, `5qsac_stt_experiment.py` — cached per-frame ResNet50 codes (8 frames) + nav vector → `MultiInputPolicy` with the trainable SpatioTemporal Transformer as its features extractor (`commons/stt.py`)
 
 ```bash
 # From the repo root. NOTE: default --port differs per script (e.g. 2000 vs 2004) — match your server.
@@ -55,7 +55,7 @@ Offline unit tests (no CARLA needed): `python tests/unit/test_<name>.py` (each f
 ```
 CarlaGymEnv              (tests/pipeline_carla_test.py)  — obs {rgb_data, nav}, action [steer, accel]
   → CBFSafetyLayerWrapper (commons/cbf_wrapper.py)       — discrete-time CBF on the action
-  → CnnNavObservationWrapper / SttNavObservationWrapper (commons/obs_wrappers.py) — image/embedding + nav, occlusion
+  → CnnNavObservationWrapper (commons/obs_wrappers.py) / SttNavObservationWrapper (commons/stt.py) — image or frame codes + nav, occlusion
 ```
 
 Supporting modules: `commons/route.py` + `commons/navigation/` (CARLA GlobalRoutePlanner routes, route projection), `commons/perception.py` (lead gap from the actor list + ground-filtered LiDAR along the curved route corridor), `commons/traffic_rules.py` (red lights, stop signs, lane-change legality), `commons/expert.py` (autopilot used for the replay-buffer warm-up), `commons/vehicle_model.py` (measured CARLA dynamics), `commons/curriculum_stages.py`, `commons/metrics_callbacks.py`.
@@ -69,7 +69,7 @@ SB3 then auto-wraps this in a `DummyVecEnv`, which breaks `.unwrapped`. Use the 
 
 **CBF layer** is a discrete-time CBF filter on `[steer, accel]` in physical units: a hard stopping-distance collision barrier (gap + lead speed; red-light stop lines count as obstacles when stoppable), a soft speed-limit row and soft signed lane rows (lookahead/HOCBF), with slack. It passes the action through untouched when no constraint is active and brakes fully when infeasible. The wrapper penalises the reward by `0.2·min(1,‖Δu‖²)` only on steps where it intervened; SB3 still stores the policy's proposed action. State comes from `CarlaGymEnv.build_cbf_state()` (the snapshot from the end of the previous step).
 
-**Perception pipeline** (`models/pipeline.py`, `Pipeline.from_defaults(...)`): ResNet50 trunk (frozen, `(2048,7,7)` maps) → `SpatioTemporalEncoder` → stacked transformer, producing one 512-dim embedding per 8-frame window. Only the encoder + transformer train; the ResNet50 is frozen.
+**STT perception** (`commons/stt.py`). Env side, frozen: each camera frame goes once through ImageNet ResNet50 at 224×128 → `(2048,4,7)` → a PCA projection to `(32,4,7)` float16; the wrapper caches the last 8 codes (repeat-padded after reset) and returns `{frames (8,32,4,7), nav}`. Policy side, trained by the SAC losses: `SttFeaturesExtractor` = `SpatioTemporalEncoder` (D=128, 2 layers) + `cnn_proj` + `StackedHierarchicalTransformer` + LayerNorm, concatenated with nav. All trainable weights are in the SAC `.zip`; the PCA is fitted once per fresh run on 1000 expert-driving frames in the full-traffic stage and stored as `model.stt_projection` (also in the `.zip`) — resume/demo call `wrapper.set_projection(model.stt_projection)`. ImageNet ResNet50 weights: `pretrained/feature_extractor/pretrained_resnet50.pth` (gitignored; downloaded once from torchvision if missing). `models/pipeline.py` / `PipelineObservationWrapper` are the old, untrained pipeline and are no longer used by the experiments.
 
 ## Reward function — read this before changing it
 

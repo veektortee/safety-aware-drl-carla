@@ -1,6 +1,7 @@
 """Offline tests for the experiment glue (no CARLA server needed).
 
-Covers commons/obs_wrappers.py (CNN/STT observation shapes, occlusion on the image only),
+Covers commons/obs_wrappers.py (CNN observation shapes, occlusion on the image only; the STT wrapper
+is tested in test_stt.py),
 commons/warmup.py (expert prefill of a real SB3 SAC MultiInputPolicy replay buffer, resume helpers)
 and commons/curriculum.py (promotion logic and state persistence), using a small fake env that
 exposes the CarlaGymEnv contract: Dict(rgb_data, nav) observation, Box(2) action,
@@ -19,7 +20,6 @@ if REPO_ROOT not in sys.path:
 
 import json
 import tempfile
-from collections import deque
 from types import SimpleNamespace
 
 import gymnasium as gym
@@ -146,40 +146,6 @@ def test_cnn_wrapper_occludes_image_only():
         env.reset()
         actives.append(env.occlusion.active)
     assert 0.15 < np.mean(actives) < 0.45
-
-
-def test_stt_wrapper_shapes_and_frame_reset():
-    import tests.pipeline_carla_test as pct
-    from commons.obs_wrappers import SttNavObservationWrapper
-
-    class FakePipelineWrapper:
-        """Stand-in for PipelineObservationWrapper: embedding = mean of the frame history."""
-
-        def __init__(self, env, embed_dim=512, num_frames=8, encoder_path=None):
-            self.embed_dim = embed_dim
-            self.frame_buffer = deque([np.zeros((360, 640, 3), np.uint8)] * num_frames, maxlen=num_frames)
-            self.pipeline = SimpleNamespace()
-
-        def observation(self, obs):
-            self.frame_buffer.append(obs["rgb_data"])
-            return np.full(self.embed_dim, np.mean([f.mean() for f in self.frame_buffer]), np.float32)
-
-    original = pct.PipelineObservationWrapper
-    pct.PipelineObservationWrapper = FakePipelineWrapper
-    try:
-        env = SttNavObservationWrapper(FakeCarlaEnv(), embed_dim=512, num_frames=8, occlusion="none")
-    finally:
-        pct.PipelineObservationWrapper = original
-    assert env.observation_space.shape == (512 + NAV_DIM,)
-    obs, _ = env.reset()
-    assert obs.shape == (512 + NAV_DIM,) and obs.dtype == np.float32
-    assert env.observation_space.contains(obs)
-    for _ in range(5):
-        obs, *_ = env.step(EXPERT)
-    assert obs[0] > 0 and obs[512] == 5.0          # embedding sees frames, nav appended at the end
-    obs, _ = env.reset()
-    assert obs[0] == 0.0, "frame history must be cleared at reset"
-    assert len(env.embedder.frame_buffer) == 8
 
 
 # --------------------------------------------------------------------------------------------------
