@@ -62,25 +62,56 @@ Packages that are needed but missing from the original `requirements.txt` (which
 
 Start CARLA, then from `CARLA-RL-Agents` with the venv active:
 
-    python ..\train_all.py --only 2q_cnn --render --carla-exe "D:\WORK\Carla\CarlaUE4.exe"
+    python ..\train_all.py --only 2q_cnn --carla-exe "D:\WORK\Carla\CarlaUE4.exe"
+
+Training is shown by default: the runner passes `--render` to the scripts (camera window +
+spectator following the car), and a CARLA it starts with `--carla-exe` opens in a normal
+visible window (`-RenderOffScreen` / `-nullrhi` are never passed). Add `--no-render` for a
+faster run with nothing drawn.
 
 Drop `--only 2q_cnn` to run all four in turn. Useful flags:
 
 | Flag | Meaning |
 |---|---|
 | `--timesteps N` | Target total steps (default 1,000,000) |
-| `--carla-exe PATH` | Let the runner start and restart CARLA itself |
+| `--no-render` | Do not pass `--render` to the scripts (rendering is ON by default) |
+| `--carla-exe PATH` | Let the runner start and restart CARLA itself (visible window) |
 | `--parallel 2` | Run two experiments at once, on ports 2000 and 2010 |
 | `--port-base 3000` | Use a different CARLA port |
 | `--keep-checkpoints N` | Keep the newest N checkpoints (0 = keep all) |
+| `--num-npc N`, `--num-pedestrians N` | Traffic per episode (default: the script's own). Fewer = faster |
+| `--log-root DIR` | Logs/checkpoints in `DIR\<name>` instead of `CARLA-RL-Agents\logs\<name>` |
+
+To skip experiments without editing anything, list their names (one per line) in
+`skip_experiments.txt` in the project root; an explicit `--only` still runs them.
 
 `train_all.py` exists because running a script directly builds a brand-new agent every
 launch. It finds the newest checkpoint and passes `--load-checkpoint`, so training always
-continues. It also converts the target into *steps remaining* — Stable-Baselines3 **adds**
-`total_timesteps` to the restored counter when `reset_num_timesteps=False`, so asking for
-1,000,000 while sitting at 300,000 would otherwise run to 1,300,000.
+continues. `--timesteps` is passed through unchanged as the *target total*: the scripts
+subtract the restored step counter themselves, so a run resumed at 300,000 trains 700,000
+more and stops at 1,000,000.
 
 Press Ctrl+C any time; rerun the same command to continue from the last checkpoint.
+
+### What a run writes
+
+The console (and `<log-dir>\runner.log`) shows one line per episode plus a summary of the last
+100 episodes every 20 episodes, and an `EVAL` block every 25,000 steps. Each `<log-dir>` holds:
+
+| File | Contents |
+|---|---|
+| `runner.log` | Copy of the console |
+| `episodes.jsonl` | One line per training episode (end reason, distance, route completion, collisions, reward components, ...) |
+| `eval.jsonl` | One line per evaluation round: 10 deterministic episodes from fixed spawn points (the headline numbers) |
+| `run_config.json` | Reward version, git commit, hyperparameters, env and CBF parameters |
+| `tensorboard\` | `tensorboard --logdir <log-dir>\tensorboard` (our tags in the `metrics` run, SB3's `train/*` losses in its own `<name>_N` run) |
+| `checkpoints\` | Model + replay buffer every 25,000 steps |
+
+Build the results report (reads the `.jsonl` files; safe while training):
+
+    python make_report.py --log-root CARLA-RL-Agents\logs --out results
+
+Every metric is defined in `METRICS.md`.
 
 ## E. CARLA troubleshooting
 

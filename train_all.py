@@ -10,25 +10,38 @@ newest checkpoint first and passes --load-checkpoint, so each launch CONTINUES
 the same agent instead of starting over.
 
 It also:
-  * Converts your target into "steps remaining". Stable-Baselines3 ADDS the
-    --timesteps value to the restored counter when resuming, so asking for
-    1,000,000 while sitting at 300,000 would actually run to 1,300,000. The
-    runner asks for 700,000 instead, so you land exactly on 1,000,000.
+  * Passes your TARGET total (--timesteps, default 1,000,000) unchanged. The
+    experiment scripts subtract the restored step counter themselves, so a run
+    resumed at 300,000 trains 700,000 more and stops exactly on 1,000,000.
   * Restarts automatically after a crash, continuing from the last checkpoint.
-  * Prints throughput (steps/sec) and an ETA to the target.
+  * Prints throughput (steps/sec) and an ETA to the target, read from the
+    per-episode console line ("ep  412 | step    98,340 | ..."), falling back
+    to the Stable-Baselines3 table ("| total_timesteps | 4000 |").
   * Prunes old checkpoints - the CNN replay buffers are ~2.1 GB each.
   * Can run several experiments at once, each against its own CARLA server.
+  * Shows the training by default: --render is passed to the scripts (camera
+    window + spectator following the car) unless you pass --no-render, and a
+    CARLA server started with --carla-exe opens in a normal visible window.
 
 Usage - run from the CARLA-RL-Agents folder with the venv active:
 
-    python ..\\train_all.py --only 2q_cnn --render
+    python ..\\train_all.py --only 2q_cnn
     python ..\\train_all.py                       # all four, one after another
     python ..\\train_all.py --parallel 2          # two at a time, ports 2000/2010
+    python ..\\train_all.py --no-render           # faster, nothing drawn
 
 A CARLA server must already be listening on each port in use, unless you pass
 --carla-exe, in which case the runner starts and restarts CARLA itself:
 
     python ..\\train_all.py --carla-exe D:\\CARLA_0.9.15\\WindowsNoEditor\\CarlaUE4.exe
+
+Experiments listed in skip_experiments.txt (project root, one name per line)
+are skipped unless named explicitly with --only.
+
+Per run, <log-dir> holds runner.log (console copy), episodes.jsonl (one line
+per training episode), eval.jsonl (deterministic evaluation every 25k steps),
+run_config.json, tensorboard/ and checkpoints/. Build the report with
+make_report.py.
 
 Stop everything with Ctrl+C. Progress is kept in the checkpoints, so starting
 the runner again simply picks up where it left off.
@@ -52,11 +65,29 @@ EXPERIMENTS = {
     "5q_stt": {"script": "5qsac_stt_experiment.py", "log_dir": "logs/5q_stt", "prefix": "sac_5q_stt"},
 }
 
-# Stable-Baselines3 prints its table as "|    total_timesteps | 4000     |"
+# Per-episode line from commons/metrics_callbacks.py: "ep  412 | step    98,340 | ..."
+EPISODE_STEP_RE = re.compile(r"^\s*ep\s+\d+\s*\|\s*step\s+([\d,]+)\s*\|")
+# Stable-Baselines3 prints its table as "|    total_timesteps | 4000     |" (fallback)
 STEP_RE = re.compile(r"\|\s*total_timesteps\s*\|\s*([0-9.]+(?:[eE][+-]?\d+)?)\s*\|")
+
+# CARLA flags that would hide the simulator window; the runner never passes them.
+HIDDEN_WINDOW_FLAGS = ("-renderoffscreen", "-nullrhi")
 
 PRINT_LOCK = threading.Lock()
 STOP = threading.Event()
+
+
+def parse_step(line):
+    """Training step reported by a console line, or None.
+
+    The per-episode line is tried first, the SB3 table row second."""
+    match = EPISODE_STEP_RE.search(line)
+    if match:
+        return int(match.group(1).replace(",", ""))
+    match = STEP_RE.search(line)
+    if match:
+        return int(float(match.group(1)))
+    return None
 
 
 def log(msg):
@@ -106,8 +137,9 @@ def prune_checkpoints(log_dir: Path, prefix: str, keep: int, name: str):
             found.append((int(match.group(1)), path))
     found.sort(reverse=True)
     for n, path in found[keep:]:
-        buffer_path = folder / f"{prefix}_replay_buffer_{n}_steps.pkl"
-        for victim in (path, buffer_path):
+        buffers = (folder / f"{prefix}_replay_buffer_{n}_steps.pkl",
+                   folder / f"{path.stem}_replay_buffer.pkl")
+        for victim in (path, *buffers):
             try:
                 if victim.exists():
                     size = victim.stat().st_size
@@ -161,9 +193,20 @@ def wait_for_port(port, seconds, name, note):
     return False
 
 
+def carla_command(exe, port, extra_args):
+    """CARLA command line for a VISIBLE window (offscreen / null-render flags are removed)."""
+    kept = []
+    for arg in extra_args:
+        if arg.lower().split("=", 1)[0] in HIDDEN_WINDOW_FLAGS:
+            log(f"ignoring CARLA flag {arg}: the simulator window must stay visible")
+            continue
+        kept.append(arg)
+    return [exe, f"-carla-rpc-port={port}", "-quality-level=Low", "-windowed"] + kept
+
+
 def start_carla(exe, port, extra_args, wait_seconds, name):
-    cmd = [exe, f"-carla-rpc-port={port}", "-quality-level=Low"] + list(extra_args)
-    log(f"[{name}] starting CARLA on port {port}")
+    cmd = carla_command(exe, port, extra_args)
+    log(f"[{name}] starting CARLA on port {port} (visible window)")
     proc = subprocess.Popen(cmd)
     if wait_for_port(port, wait_seconds, name, "waiting for CARLA to finish loading..."):
         log(f"[{name}] CARLA is up on port {port}")
@@ -212,9 +255,8 @@ def stream_run(cmd, cwd, env, log_file, name, echo, samples, target, eta_every):
                         sys.stdout.write(line)
                         sys.stdout.flush()
 
-                match = STEP_RE.search(line)
-                if match:
-                    step = int(float(match.group(1)))
+                step = parse_step(line)
+                if step is not None:
                     highest_step = max(highest_step, step)
                     samples.append((time.time(), step))
                     if time.time() - last_report >= eta_every:
@@ -237,8 +279,36 @@ def stream_run(cmd, cwd, env, log_file, name, echo, samples, target, eta_every):
     return returncode, highest_step, saw_error
 
 
+def exp_log_dir(name, cfg, args):
+    if args.log_root:
+        return (Path(args.log_root) / name).resolve()
+    return (args.cwd / cfg["log_dir"]).resolve()
+
+
+def build_command(script, port, log_dir, checkpoint, args):
+    """Experiment command line. --timesteps is the TARGET total; the script subtracts
+    the restored step counter itself when resuming."""
+    cmd = [
+        sys.executable,
+        str(script),
+        "--timesteps", str(args.timesteps),
+        "--port", str(port),
+        "--log-dir", str(log_dir),
+        "--buffer-size", str(args.buffer_size),
+    ]
+    if args.render:
+        cmd.append("--render")
+    if args.num_npc is not None:
+        cmd += ["--num-npc", str(args.num_npc)]
+    if args.num_pedestrians is not None:
+        cmd += ["--num-pedestrians", str(args.num_pedestrians)]
+    if checkpoint is not None:
+        cmd += ["--load-checkpoint", str(checkpoint)]
+    return cmd
+
+
 def run_experiment(name, cfg, args, port):
-    log_dir = (args.cwd / cfg["log_dir"]).resolve()
+    log_dir = exp_log_dir(name, cfg, args)
     log_dir.mkdir(parents=True, exist_ok=True)
     runner_log = log_dir / "runner.log"
 
@@ -294,18 +364,7 @@ def run_experiment(name, cfg, args, port):
                     continue
                 log(f"[{name}] CARLA found on port {port}")
 
-            cmd = [
-                sys.executable,
-                str(script),
-                "--timesteps", str(remaining),
-                "--port", str(port),
-                "--log-dir", str(log_dir),
-                "--buffer-size", str(args.buffer_size),
-            ]
-            if args.render:
-                cmd.append("--render")
-            if checkpoint is not None:
-                cmd += ["--load-checkpoint", str(checkpoint)]
+            cmd = build_command(script, port, log_dir, checkpoint, args)
 
             if checkpoint is None:
                 log(f"[{name}] starting fresh, target {args.timesteps:,} steps, port {port}")
@@ -347,12 +406,7 @@ def run_experiment(name, cfg, args, port):
     return False
 
 
-def main():
-    try:  # so mirrored output with non-ASCII characters never kills the runner
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-
+def build_parser():
     parser = argparse.ArgumentParser(
         description="Run the CARLA SAC experiments to a target timestep count, resuming after crashes."
     )
@@ -366,8 +420,15 @@ def main():
     parser.add_argument("--port-base", type=int, default=2000, help="First CARLA port (default 2000)")
     parser.add_argument("--port-step", type=int, default=None,
                         help="Port gap between parallel experiments (default 0 when --parallel 1, else 10)")
-    parser.add_argument("--render", action="store_true", help="Pass --render to the experiment scripts")
+    parser.add_argument("--render", dest="render", action="store_true", default=True,
+                        help="Show the training: pass --render to the experiment scripts (default ON)")
+    parser.add_argument("--no-render", dest="render", action="store_false",
+                        help="Do not pass --render (no camera window / spectator follow; faster)")
     parser.add_argument("--buffer-size", type=int, default=50000, help="Replay buffer size (default 50000)")
+    parser.add_argument("--num-npc", type=int, default=None,
+                        help="NPC vehicles per episode (default: the script's own). Fewer = faster")
+    parser.add_argument("--num-pedestrians", type=int, default=None,
+                        help="Pedestrians per episode (default: the script's own). Fewer = faster")
     parser.add_argument("--keep-checkpoints", type=int, default=3,
                         help="Keep only the newest N checkpoints per experiment; 0 disables pruning "
                              "(default 3 - CNN replay buffers are ~2.1 GB each)")
@@ -378,20 +439,34 @@ def main():
     parser.add_argument("--eta-every", type=float, default=120.0,
                         help="Seconds between ETA lines (default 120)")
     parser.add_argument("--carla-exe", default=None,
-                        help="Path to CarlaUE4.exe. If given, the runner starts and restarts CARLA itself.")
+                        help="Path to CarlaUE4.exe. If given, the runner starts and restarts CARLA itself "
+                             "(always in a visible window).")
     parser.add_argument("--carla-arg", action="append", default=[],
-                        help="Extra argument for CARLA; repeat for several")
+                        help="Extra argument for CARLA; repeat for several "
+                             "(-RenderOffScreen / -nullrhi are ignored)")
     parser.add_argument("--carla-wait", type=float, default=180.0,
                         help="Seconds to wait for CARLA to start answering on its port (default 180)")
     parser.add_argument("--exp-dir", default=None,
                         help="Folder holding the experiment scripts (default: ../experiments)")
+    parser.add_argument("--log-root", default=None,
+                        help="Put each experiment's logs/checkpoints in <log-root>/<name> "
+                             "instead of CARLA-RL-Agents/logs/<name>")
     parser.add_argument("--cwd", default=None,
                         help="Folder to run from (default: the current folder, normally CARLA-RL-Agents)")
     parser.add_argument("--wandb", action="store_true",
                         help="Allow W&B online mode (default: offline, so it never prompts)")
     parser.add_argument("--quiet", action="store_true",
                         help="Do not mirror the training output to the console (it still goes to runner.log)")
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv=None):
+    try:  # so mirrored output with non-ASCII characters never kills the runner
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+    args = build_parser().parse_args(argv)
 
     args.cwd = Path(args.cwd).resolve() if args.cwd else Path.cwd()
     args.exp_dir = Path(args.exp_dir).resolve() if args.exp_dir else (args.cwd.parent / "experiments")
@@ -401,16 +476,33 @@ def main():
     args.echo = (not args.quiet) and args.parallel == 1
 
     names = args.only or list(EXPERIMENTS)
+
+    # skip_experiments.txt (project root, one name per line) drops experiments
+    # without editing the launcher. Logged as "DONE - skipped" so the watchdog
+    # treats them as finished.
+    # An explicit --only always runs exactly what it names.
+    skip_file = args.cwd.parent / "skip_experiments.txt"
+    if skip_file.is_file() and not args.only:
+        skipped = {s.strip() for s in skip_file.read_text().split() if s.strip()}
+        for name in [n for n in names if n in skipped]:
+            log(f"[{name}] DONE - skipped (listed in {skip_file.name}), not trained")
+        names = [n for n in names if n not in skipped]
+        if not names:
+            log("nothing left to train")
+            return
+
     ports = {name: args.port_base + i * args.port_step for i, name in enumerate(names)}
 
     log(f"working folder : {args.cwd}")
     log(f"experiments    : {args.exp_dir}")
     log(f"target         : {args.timesteps:,} steps each")
     log(f"running        : {', '.join(f'{n} (port {ports[n]})' for n in names)}")
+    log(f"rendering      : {'ON (camera window + spectator follow)' if args.render else 'OFF (--no-render)'}")
     if args.parallel > 1:
         log(f"parallel       : {args.parallel} at a time - a CARLA server must be listening on each port")
         if args.render:
-            log("warning: --render with several experiments at once is very heavy on GPU and RAM")
+            log("warning: rendering several experiments at once is very heavy on GPU and RAM "
+                "(add --no-render to save resources)")
     if not args.carla_exe:
         log("CARLA is assumed to be running already (pass --carla-exe to let the runner manage it)")
     log(f"keeping the newest {args.keep_checkpoints} checkpoints per experiment"
@@ -450,7 +542,7 @@ def main():
     print(flush=True)
     log("summary:")
     for name in names:
-        log_dir = (args.cwd / EXPERIMENTS[name]["log_dir"]).resolve()
+        log_dir = exp_log_dir(name, EXPERIMENTS[name], args)
         _, steps = latest_checkpoint(log_dir, EXPERIMENTS[name]["prefix"])
         state = {True: "finished", False: "incomplete"}.get(results.get(name), "not started")
         log(f"  {name:8s} {state:11s} last checkpoint {steps:,} steps")
