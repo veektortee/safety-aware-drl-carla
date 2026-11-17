@@ -1,483 +1,300 @@
 """
-5 Q-Networks SAC with SpatioTemporal Transformer (STT)
-- Architecture: ResNet50 → SpatioTemporal Transformer → SAC
-- Q-network ensemble: 5 critics (higher uncertainty estimation)
-- 200 NPC vehicles + 200 pedestrians
-- Random occlusions (30% of episodes)
-- Waypoint logging (junctions, merges, lane changes)
-- Reverse reward for collision recovery
+5 Q-network SAC with the SpatioTemporal Transformer (STT)
+
+Stack:
+    CarlaGymEnv              obs Dict(rgb_data 360x640x3, nav), action [steer, accel] in [-1, 1]^2
+      -> CBFSafetyLayerWrapper    discrete-time CBF QP; trust from the critic ensemble tightens it
+      -> SttNavObservationWrapper ResNet50 -> STT over the last 8 frames (512-d) + nav vector
+                                  -> Box(512 + NAV_DIM); occlusions in 30% of episodes
+    SAC 'MlpPolicy' on the concatenated vector, ensemble of 5 critics.
+
+The transformer weights are not part of the SAC .zip: they are saved to
+<log-dir>/checkpoints/transformer/ and restored automatically on --load-checkpoint.
+
+Training: the replay buffer is first filled with expert-driver transitions (--warmup-steps), then
+SAC learns (learning_starts=1000). The curriculum S0..S3 (commons/curriculum_stages.py) is promoted
+automatically unless --no-curriculum. A CARLA server must be running on --port.
 
 Usage:
-    python 5qsac_stt_experiment.py --timesteps 100000 --render
-    python 5qsac_stt_experiment.py --timesteps 50000 --log-dir ./logs/5q_stt_v1
+    python experiments/5qsac_stt_experiment.py --render
+    python experiments/5qsac_stt_experiment.py --timesteps 1000000 --log-dir ./logs/5q_stt
+    python experiments/5qsac_stt_experiment.py --load-checkpoint ./logs/5q_stt/checkpoints/sac_5q_stt_250000_steps.zip
+
+--timesteps is the TARGET TOTAL: resuming a 250k checkpoint with --timesteps 1000000 trains 750k
+more steps. Expert warm-up steps are not counted.
 """
 
+import argparse
 import os
 import sys
-import argparse
-import numpy as np
-import torch
+import traceback
 from pathlib import Path
-from datetime import datetime
-from typing import Optional
 
-# Add project paths
-sys.path.insert(0, str(Path(__file__).parent.parent))
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
-import gymnasium as gym
-from gymnasium import spaces
 from stable_baselines3 import SAC
-from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
+from stable_baselines3.common.callbacks import CheckpointCallback, LogEveryNTimesteps
 from stable_baselines3.common.logger import configure
 
-import carla
-
-from tests.pipeline_carla_test import (
-    CarlaGymEnv, 
-    PipelineObservationWrapper,
-    CBFSafetyLayerWrapper,
-    ComprehensiveMetricsLoggingCallback,
-    PolicyTrustScoreCallback,
-    SafetyMetricsCallback,
+from tests.pipeline_carla_test import CarlaGymEnv, CBFSafetyLayerWrapper, PolicyTrustScoreCallback
+from commons.metrics_callbacks import EpisodeMetricsCallback, EvalCallback, write_run_config
+from commons.obs_wrappers import (
+    SttNavObservationWrapper,
+    TransformerCheckpointCallback,
+    find_transformer_checkpoint,
 )
-from experiments.occlusions import OcclusionStrategy
-from experiments.waypoint_logger import WaypointContextLogger
+from commons.curriculum import CurriculumCallback, resolve_start_stage
+from commons.curriculum_stages import FINAL_STAGE
+from commons.warmup import (
+    checkpoint_num_timesteps,
+    describe_env_stack,
+    prefill_replay_buffer,
+    restore_replay_buffer,
+    save_checkpoint,
+)
+
+EXPERIMENT = "5q_stt"
+NAME_PREFIX = "sac_5q_stt"
+POLICY = "MlpPolicy"
+N_CRITICS = 5
+DEFAULT_PORT = 2000
+DEFAULT_ENCODER = "pretrained/st_encoder/st_encoder.pth"  # used if present
+EMBED_DIM = 512
+NUM_FRAMES = 8
+TIME_LIMIT = 3000          # upper bound; the env derives a shorter per-route limit
+LEARNING_STARTS = 1000
+SAVE_FREQ = 25000
+EVAL_FREQ = 25000
+EVAL_EPISODES = 10
+SB3_TABLE_EVERY = 1000     # steps between SB3 stdout tables (train/* losses)
+OCCLUSION = "mixed"
 
 
-class LocationContextWrapper(gym.Wrapper):
-    """Log waypoint context during episodes"""
-    
-    def __init__(self, env, carla_map):
-        super().__init__(env)
-        self.carla_map = carla_map
-        self.waypoint_logger = WaypointContextLogger()
-    
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        
-        # Log waypoint context
-        if hasattr(self.env.unwrapped, 'ego_vehicle'):
-            vehicle = self.env.unwrapped.ego_vehicle
-            location = vehicle.get_location()
-            context = self.waypoint_logger.log_waypoint(self.carla_map, location)
-            
-            if context.get('valid'):
-                # Add event-based reward
-                if context.get('event') == 'JUNCTION':
-                    info['location_event'] = 'junction'
-                elif 'MERGE' in context.get('event', ''):
-                    info['location_event'] = 'merge'
-                elif 'LANE_CHANGE' in context.get('event', ''):
-                    info['location_event'] = 'lane_change'
-        
-        return obs, reward, terminated, truncated, info
-    
-    def reset(self, **kwargs):
-        self.waypoint_logger.reset_episode()
-        return self.env.reset(**kwargs)
+def _resolve_encoder_path(path):
+    """Relative paths are tried from the working directory, then from the repo root."""
+    if not path:
+        return None
+    for candidate in (Path(path), REPO_ROOT / path):
+        if candidate.is_file():
+            return str(candidate)
+    print(f"[ENV] encoder checkpoint {path} not found; the SpatioTemporalEncoder keeps its initial weights")
+    return None
 
 
-class OcclusionWrapper(gym.ObservationWrapper):
-    """Apply random occlusions to observations"""
-    
-    def __init__(self, env, occlusion_type='mixed'):
-        super().__init__(env)
-        self.occlusion = OcclusionStrategy(occlusion_type)
-    
-    def observation(self, obs):
-        return self.occlusion.apply(obs)
-    
-    def reset(self, **kwargs):
-        self.occlusion.reset_episode()
-        result = self.env.reset(**kwargs)
-        if isinstance(result, tuple):
-            obs, info = result
-            return self.occlusion.apply(obs), info
-        else:
-            return self.occlusion.apply(result)
-
-
-class ReversalRewardCallback(BaseCallback):
-    """Reward reversing after collision for recovery learning"""
-    
-    def __init__(self, verbose=0):
-        super().__init__(verbose)
-        self.collision_happened = False
-    
-    def _on_step(self) -> bool:
-        return True
-
-
-class TransformerCheckpointCallback(BaseCallback):
-    """Save transformer weights separately during training"""
-    
-    def __init__(self, save_freq: int = 10000, save_path: str = "./checkpoints", verbose: int = 0):
-        super().__init__(verbose)
-        self.save_freq = save_freq
-        self.save_path = save_path
-        os.makedirs(save_path, exist_ok=True)
-    
-    def _on_step(self) -> bool:
-        if self.num_timesteps % self.save_freq == 0:
-            try:
-                # Access the environment wrapper stack to get the pipeline
-                env = self.training_env
-                
-                # Unwrap to get PipelineObservationWrapper
-                pipeline_wrapper = None
-                current_env = env
-                while hasattr(current_env, 'env'):
-                    if isinstance(current_env, PipelineObservationWrapper):
-                        pipeline_wrapper = current_env
-                        break
-                    current_env = current_env.env
-                
-                if current_env is not None and isinstance(current_env, PipelineObservationWrapper):
-                    pipeline_wrapper = current_env
-                
-                if pipeline_wrapper is not None:
-                    pipeline = pipeline_wrapper.pipeline
-                    
-                    # Save transformer components
-                    transformer_state = {
-                        'st_encoder': pipeline.st_encoder.state_dict(),
-                        'stacked_transformer': pipeline.stacked_transformer.state_dict(),
-                        'timesteps': self.num_timesteps
-                    }
-                    
-                    checkpoint_path = os.path.join(
-                        self.save_path,
-                        f"transformer_checkpoint_{self.num_timesteps}.pth"
-                    )
-                    torch.save(transformer_state, checkpoint_path)
-                    
-                    if self.verbose > 0:
-                        print(f"[TRANSFORMER] Saved checkpoint at {self.num_timesteps} steps: {checkpoint_path}")
-                else:
-                    if self.verbose > 0:
-                        print("[TRANSFORMER] Warning: Could not find PipelineObservationWrapper in environment stack")
-            except Exception as e:
-                print(f"[TRANSFORMER] Error saving checkpoint: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        return True
-
-
-def create_stt_env(
-    num_timesteps: int = 100000,
-    render: bool = False,
-    num_npc: int = 200,
-    num_pedestrians: int = 200,
-    encoder_path: Optional[str] = None,
-    port: int = 2000
-) -> gym.Env:
-    """Create full environment stack: CARLA → STT → CBF → Occlusions
-    
-    Args:
-        num_timesteps: Total timesteps (unused but kept for compatibility)
-        render: Enable rendering
-        num_npc: Number of NPC vehicles
-        num_pedestrians: Number of pedestrians
-        encoder_path: Path to pretrained encoder checkpoint
-    """
-    
-    print("[ENV] Creating CARLA environment...")
-    
-    # Base CARLA environment
+def create_stt_env(port: int = DEFAULT_PORT, render: bool = False, num_npc: int = 200,
+                   num_pedestrians: int = 200, curriculum_stage: int = 0, encoder_path=None):
+    """CarlaGymEnv -> CBFSafetyLayerWrapper -> SttNavObservationWrapper."""
+    print(f"[ENV] Connecting to CARLA on port {port} (curriculum stage {curriculum_stage})...")
     env = CarlaGymEnv(
-        host='localhost',
+        host="localhost",
         port=port,
         timeout=10.0,
-        time_limit=1000,
-        render_mode='human' if render else None,
+        time_limit=TIME_LIMIT,
+        render_mode="human" if render else None,   # spectator follows the ego car
         num_npc_vehicles=num_npc,
         num_pedestrians=num_pedestrians,
-        show_sensor_data=render
+        show_sensor_data=render,                    # camera window
+        curriculum_stage=curriculum_stage,
     )
-    
-    # Get map for waypoint logging
-    carla_map = env.world.get_map()
-    
-    print("[ENV] Adding location context logging...")
-    env = LocationContextWrapper(env, carla_map)
-    
-    print("[ENV] Adding pipeline observation wrapper (STT)...")
-    env = PipelineObservationWrapper(env, embed_dim=512, num_frames=8, encoder_path=encoder_path)
-    
-    print("[ENV] Adding CBF safety layer...")
-    env = CBFSafetyLayerWrapper(env, alpha=1.0)
-    
-    print("[ENV] Adding occlusion wrapper...")
-    env = OcclusionWrapper(env, occlusion_type='mixed')
-    
-    print("[OK] Environment fully initialized\n")
-    
+    env = CBFSafetyLayerWrapper(env)
+    env = SttNavObservationWrapper(env, embed_dim=EMBED_DIM, num_frames=NUM_FRAMES,
+                                   encoder_path=_resolve_encoder_path(encoder_path), occlusion=OCCLUSION)
+    print("[ENV] CarlaGymEnv -> CBFSafetyLayerWrapper -> SttNavObservationWrapper ready")
     return env
 
 
-def train_5q_stt_sac(
-    timesteps: int = 100000,
-    port: int = 2000,
-    log_dir: str = "./logs/5q_stt",
-    learning_rate: float = 3e-4,
-    batch_size: int = 64,
-    buffer_size: int = 50000,
-    render: bool = False,
-    num_npc: int = 100,
-    num_pedestrians: int = 30,
-    encoder_path: Optional[str] = None,
-    load_checkpoint: str = None
-):
-    """Train 5 Q-Network SAC with STT
-
-    Args:
-        timesteps: Total training timesteps
-        log_dir: Directory for logs and checkpoints
-        learning_rate: SAC learning rate
-        batch_size: Training batch size
-        buffer_size: Replay buffer size
-        render: Enable rendering
-        num_npc: Number of NPC vehicles
-        num_pedestrians: Number of pedestrians
-        encoder_path: Path to pretrained encoder checkpoint
-        load_checkpoint: Path to a saved SAC .zip to resume from. When given, the
-            SAC weights/optimizer/hyperparameters are restored and training
-            CONTINUES (timestep counter and TensorBoard curves are not reset).
-            NOTE: the replay buffer is NOT stored in the SAC .zip, so it restarts
-            empty (refilling over the first `learning_starts` steps) unless a
-            matching '*_replay_buffer.pkl' sits beside the checkpoint.
-            CAVEAT (STT-specific): the SpatioTemporal Transformer (st_encoder +
-            stacked_transformer) lives in the environment pipeline, NOT in the
-            SAC .zip, so it is re-initialized on resume. `--encoder-path` can
-            restore the st_encoder if it points at a compatible st_encoder
-            state_dict, but the stacked_transformer is not currently
-            checkpoint-restorable — for a true continuation the transformer
-            effectively re-trains from its init.
-    """
-    
-    os.makedirs(log_dir, exist_ok=True)
+def train(args) -> int:
+    log_dir = args.log_dir
     tb_dir = os.path.join(log_dir, "tensorboard")
     ckpt_dir = os.path.join(log_dir, "checkpoints")
+    transformer_dir = os.path.join(ckpt_dir, "transformer")
     os.makedirs(tb_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
-    
+
+    resume = bool(args.load_checkpoint)
+    if resume:
+        if not os.path.isfile(args.load_checkpoint):
+            raise FileNotFoundError(f"--load-checkpoint not found: {args.load_checkpoint}")
+        done = checkpoint_num_timesteps(args.load_checkpoint)
+        if done is not None and done >= args.timesteps:
+            print(f"[RESUME] checkpoint is at {done:,} steps; target {args.timesteps:,} already reached. Nothing to do.")
+            return 0
+
+    start_stage = FINAL_STAGE if args.no_curriculum else args.start_stage
+    env_stage = resolve_start_stage(log_dir, start_stage, resume=resume)
+
     print("=" * 80)
-    print("5 Q-NETWORK SAC WITH SPATIOTEMPORAL TRANSFORMER (STT)")
+    print(f"SAC {EXPERIMENT}: {POLICY}, {N_CRITICS} critics, STT embedding {EMBED_DIM} + nav")
+    print(f"target {args.timesteps:,} steps | lr {args.lr} | batch {args.batch_size} | buffer {args.buffer_size:,}")
+    print(f"warm-up {args.warmup_steps:,} expert steps | curriculum {'off (final stage)' if args.no_curriculum else 'on'}"
+          f" | stage {env_stage} | NPC {args.num_npc} | pedestrians {args.num_pedestrians}")
+    print(f"render {args.render} | port {args.port} | log dir {log_dir}")
+    if resume:
+        print(f"resume from {args.load_checkpoint}")
     print("=" * 80)
-    print(f"Timesteps: {timesteps:,}")
-    print(f"Q-networks: 5 (higher uncertainty estimation)")
-    print(f"Perception: ResNet50 → STT → 512-dim embedding")
-    print(f"Learning rate: {learning_rate}")
-    print(f"Batch size: {batch_size}")
-    print(f"Buffer size: {buffer_size:,}")
-    print(f"NPC vehicles: {num_npc}")
-    print(f"Pedestrians: {num_pedestrians}")
-    print(f"Render: {render}")
-    print(f"Encoder: {encoder_path if encoder_path else 'Training from scratch'}")
-    print(f"Log dir: {log_dir}")
-    print("=" * 80 + "\n")
-    
-    # Create environment
-    env = create_stt_env(
-        num_timesteps=timesteps,
-        render=render,
-        num_npc=num_npc,
-        num_pedestrians=num_pedestrians,
-        encoder_path=encoder_path,
-        port=port
-    )
-    
-    # Policy kwargs with 5 Q-networks (ensemble)
-    policy_kwargs = {
-        'net_arch': {
-            'pi': [256, 256],    # Actor network
-            'qf': [256, 256]     # Critic networks
-        },
-        'n_critics': 5,          # 5 Q-networks (ensemble) - better uncertainty
-        'normalize_images': True,
-    }
-    
-    if load_checkpoint:
-        # Resume: restore weights/optimizer/hyperparameters and continue.
-        if not os.path.isfile(load_checkpoint):
-            raise FileNotFoundError(f"--load-checkpoint not found: {load_checkpoint}")
-        print(f"Resuming SAC agent from checkpoint: {load_checkpoint}")
-        model = SAC.load(load_checkpoint, env=env, tensorboard_log=tb_dir)
-        # Try to restore a matching replay buffer if one was saved alongside the
-        # checkpoint (e.g. '<ckpt>_replay_buffer.pkl'); otherwise warn that the
-        # buffer starts empty.
-        import re
-        rb_candidates = [
-            load_checkpoint.replace(".zip", "_replay_buffer.pkl"),
-            re.sub(r"_(\d+)_steps\.zip$", r"_replay_buffer_\1_steps.pkl", load_checkpoint),
-        ]
-        rb_path = next((p for p in rb_candidates if os.path.isfile(p)), None)
-        if rb_path:
-            model.load_replay_buffer(rb_path)
-            print(f"[OK] Replay buffer restored from {rb_path} "
-                  f"({model.replay_buffer.size()} transitions)")
-        else:
-            print("[WARN] No saved replay buffer found for this checkpoint — the "
-                  "buffer starts EMPTY and refills over the first `learning_starts` "
-                  "steps. Network weights are preserved, so this is still a true "
-                  "continuation, not a from-scratch run.")
-        # The STT (st_encoder + stacked_transformer) is NOT in the SAC .zip — it
-        # lives in the env pipeline and is re-initialized unless --encoder-path
-        # restores the st_encoder. See this function's docstring.
-        print("[WARN] SpatioTemporal Transformer weights are NOT restored from the "
-              "SAC checkpoint; only the SAC actor/critic networks are. Pass "
-              "--encoder-path to restore a compatible st_encoder.")
-        print("[OK] Agent resumed\n")
-    else:
-        print("Creating SAC agent with 5 Q-networks...")
-        model = SAC(
-            'MlpPolicy',
-            env,
-            learning_rate=learning_rate,
-            batch_size=batch_size,
-            buffer_size=buffer_size,
-            gamma=0.99,
-            tau=0.005,
-            train_freq=1,
-            gradient_steps=1,
-            ent_coef='auto',
-            policy_kwargs=policy_kwargs,
-            tensorboard_log=tb_dir,
-            verbose=1
-        )
-        print("[OK] Agent created\n")
-    
-    # Setup logger
-    logger = configure(tb_dir, ["stdout", "tensorboard"])
-    model.set_logger(logger)
-    
-    # Callbacks
-    # save_replay_buffer=True so future resumes can restore the buffer and avoid
-    # the empty-buffer warm-up. name_prefix unchanged for checkpoint compatibility.
-    checkpoint_callback = CheckpointCallback(
-        save_freq=10000,
-        save_path=ckpt_dir,
-        name_prefix="sac_5q_stt",
-        save_replay_buffer=True
-    )
-    
-    transformer_callback = TransformerCheckpointCallback(
-        save_freq=10000,
-        save_path=os.path.join(ckpt_dir, "transformer"),
-        verbose=1
-    )
-    
-    safety_callback = SafetyMetricsCallback(verbose=1)
-    trust_callback = PolicyTrustScoreCallback(update_freq=100, verbose=1)
-    metrics_callback = ComprehensiveMetricsLoggingCallback(verbose=1, log_frequency=1)
-    
-    # Train
-    print(f"Training for {timesteps:,} timesteps...\n")
+
+    env = create_stt_env(port=args.port, render=args.render, num_npc=args.num_npc,
+                         num_pedestrians=args.num_pedestrians, curriculum_stage=env_stage,
+                         encoder_path=args.encoder_path)
     try:
-        model.learn(
-            total_timesteps=timesteps,
-            log_interval=1,
-            callback=[checkpoint_callback, transformer_callback, safety_callback, trust_callback, metrics_callback],
-            progress_bar=True,
-            # Resume → keep the existing timestep counter and TB curves (true
-            # continuation). Fresh run → start from 0.
-            reset_num_timesteps=not bool(load_checkpoint)
-        )
-    except KeyboardInterrupt:
-        print("\n[INTERRUPT] Training interrupted by user")
-    except Exception as e:
-        print(f"\n[ERROR] {e}")
-        import traceback
-        traceback.print_exc()
-    
-    # Save final model
-    final_path = os.path.join(log_dir, "sac_5q_stt_final.zip")
-    model.save(final_path)
-    print(f"\n[OK] Final model saved: {final_path}")
-    
-    # Save experiment info
-    info_path = os.path.join(log_dir, "experiment_info.txt")
-    with open(info_path, "w") as f:
-        f.write("5 Q-Network SAC with SpatioTemporal Transformer\n")
-        f.write("=" * 60 + "\n\n")
-        f.write(f"Timesteps: {timesteps:,}\n")
-        f.write(f"Q-networks: 5 (ensemble for better uncertainty)\n")
-        f.write(f"Learning rate: {learning_rate}\n")
-        f.write(f"Batch size: {batch_size}\n")
-        f.write(f"Buffer size: {buffer_size:,}\n")
-        f.write(f"NPC vehicles: {num_npc}\n")
-        f.write(f"Pedestrians: {num_pedestrians}\n")
-        f.write(f"Encoder checkpoint: {encoder_path if encoder_path else 'None (training from scratch)'}\n")
-        f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"\nArchitecture:\n")
-        f.write(f"- Perception: ResNet50 {'(pretrained on CARLA)' if encoder_path else '(ImageNet)'}\n")
-        f.write(f"- ResNet50 status: {'Frozen (weights not updated)' if encoder_path else 'Trainable'}\n")
-        f.write(f"- Transformer: SpatioTemporal Transformer (8 frames, 4 blocks)\n")
-        f.write(f"- Transformer status: Trainable from scratch\n")
-        f.write(f"- Output embedding: 512-dim\n")
-        f.write(f"- Policy: MlpPolicy (256-256)\n")
-        f.write(f"- Q-networks: 5 critics (256-256 each) - ensemble uncertainty\n")
-        f.write(f"\nFeatures:\n")
-        f.write(f"- CBF safety layer (dynamic constraints)\n")
-        f.write(f"- Random occlusions (30% episodes)\n")
-        f.write(f"- Waypoint logging (junctions, merges, lanes)\n")
-        f.write(f"- Reverse reward for collision recovery\n")
-        f.write(f"\nDifference from 2q variant:\n")
-        f.write(f"- Uses 5 Q-networks instead of 2\n")
-        f.write(f"- Better uncertainty estimation via ensemble\n")
-        f.write(f"- More conservative action selection\n")
-    
-    print(f"[OK] Experiment info saved: {info_path}")
-    
-    # Cleanup
-    env.close()
-    print("[OK] Environment closed")
-    
-    print("\n" + "=" * 80)
-    print("TRAINING COMPLETE")
-    print("=" * 80)
-    print(f"View results: tensorboard --logdir {tb_dir}")
+        policy_kwargs = {
+            "net_arch": {"pi": [256, 256], "qf": [256, 256]},
+            "n_critics": N_CRITICS,
+            "normalize_images": True,
+        }
+        buffer_restored = False
+        transformer_restored = None
+        if resume:
+            # The policy was trained on embeddings of THIS run's transformer: restore it before any
+            # observation is computed.
+            transformer_restored = (find_transformer_checkpoint(args.load_checkpoint)
+                                    or find_transformer_checkpoint(args.load_checkpoint, transformer_dir))
+            if transformer_restored:
+                env.load_transformer(transformer_restored)
+                print(f"[RESUME] transformer weights restored from {transformer_restored}")
+            else:
+                print("[RESUME] WARNING: no transformer_checkpoint_*.pth found for this checkpoint; the "
+                      "STT starts from new weights, so the policy sees different embeddings than in training")
+            try:
+                model = SAC.load(args.load_checkpoint, env=env, tensorboard_log=tb_dir)
+            except ValueError as exc:
+                print(f"[ERROR] cannot resume from {args.load_checkpoint}: {exc}\n"
+                      "        Checkpoints from before the v3 env (3-D action, old observation) are "
+                      "incompatible; start a fresh run.")
+                return 1
+            buffer_restored = restore_replay_buffer(model, args.load_checkpoint)
+            print(f"[RESUME] model restored at {model.num_timesteps:,} steps")
+        else:
+            model = SAC(
+                POLICY,
+                env,
+                learning_rate=args.lr,
+                buffer_size=args.buffer_size,
+                learning_starts=LEARNING_STARTS,
+                batch_size=args.batch_size,
+                tau=0.005,
+                gamma=0.99,
+                train_freq=1,
+                gradient_steps=1,
+                ent_coef="auto",
+                policy_kwargs=policy_kwargs,
+                tensorboard_log=tb_dir,
+                verbose=1,
+            )
+
+        remaining = max(0, args.timesteps - model.num_timesteps)
+        if remaining == 0:
+            print(f"[RESUME] target {args.timesteps:,} steps already reached. Nothing to do.")
+            return 0
+
+        model.set_logger(configure(tb_dir, ["stdout", "tensorboard"]))
+
+        warmup_steps = 0 if buffer_restored else max(0, args.warmup_steps)
+        write_run_config(log_dir, model, extra={
+            "experiment": EXPERIMENT,
+            "policy": POLICY,
+            "n_critics": N_CRITICS,
+            "net_arch": policy_kwargs["net_arch"],
+            "observation": f"STT embedding ({EMBED_DIM}, {NUM_FRAMES} frames) + nav, concatenated",
+            "encoder_path": args.encoder_path,
+            "transformer_restored_from": transformer_restored,
+            "occlusion": OCCLUSION,
+            "timesteps_target": args.timesteps,
+            "timesteps_at_start": int(model.num_timesteps),
+            "warmup_steps": warmup_steps,
+            "learning_starts": LEARNING_STARTS,
+            "time_limit": TIME_LIMIT,
+            "curriculum": {"enabled": not args.no_curriculum, "start_stage": start_stage, "env_stage": env_stage},
+            "num_npc": args.num_npc,
+            "num_pedestrians": args.num_pedestrians,
+            "port": args.port,
+            "render": args.render,
+            "resumed_from": args.load_checkpoint,
+            "replay_buffer_restored": buffer_restored,
+            "stack": describe_env_stack(model),
+        })
+
+        if warmup_steps > 0:
+            try:
+                prefill_replay_buffer(model, warmup_steps, log_every=1000)
+            except KeyboardInterrupt:
+                print("\n[INTERRUPT] stopped during the expert warm-up; nothing saved")
+                return 1
+
+        callbacks = [
+            CheckpointCallback(save_freq=SAVE_FREQ, save_path=ckpt_dir, name_prefix=NAME_PREFIX,
+                               save_replay_buffer=True),
+            TransformerCheckpointCallback(save_freq=SAVE_FREQ, save_path=transformer_dir, verbose=1),
+            EvalCallback(eval_freq=EVAL_FREQ, n_episodes=EVAL_EPISODES, log_dir=log_dir, verbose=1),
+            PolicyTrustScoreCallback(update_freq=100),
+            EpisodeMetricsCallback(log_dir=log_dir, verbose=1),
+            CurriculumCallback(log_dir, start_stage=start_stage, verbose=1),
+            LogEveryNTimesteps(n_steps=SB3_TABLE_EVERY),
+        ]
+
+        print(f"[TRAIN] {remaining:,} steps to go (from {model.num_timesteps:,} to {args.timesteps:,})")
+        try:
+            # reset_num_timesteps=False: SB3 adds `remaining` to the current counter, and the episode
+            # left running by the warm-up continues (no extra reset).
+            model.learn(total_timesteps=remaining, callback=callbacks, log_interval=None,
+                        progress_bar=False, reset_num_timesteps=False)
+        except KeyboardInterrupt:
+            print(f"\n[INTERRUPT] training interrupted at {model.num_timesteps:,} steps")
+            save_checkpoint(model, ckpt_dir, NAME_PREFIX)
+            env.save_transformer(os.path.join(transformer_dir, f"transformer_checkpoint_{model.num_timesteps}.pth"),
+                                 timesteps=model.num_timesteps)
+            return 1
+        except Exception as exc:  # noqa: BLE001 - keep the run resumable, then report
+            print(f"\n[ERROR] {exc}")
+            traceback.print_exc()
+            try:
+                save_checkpoint(model, ckpt_dir, NAME_PREFIX)
+                env.save_transformer(os.path.join(transformer_dir, f"transformer_checkpoint_{model.num_timesteps}.pth"),
+                                     timesteps=model.num_timesteps)
+            except Exception as save_exc:  # noqa: BLE001
+                print(f"[ERROR] could not save a checkpoint after the failure: {save_exc}")
+            return 1
+
+        final_path = os.path.join(log_dir, f"{NAME_PREFIX}_final.zip")
+        model.save(final_path)
+        env.save_transformer(os.path.join(transformer_dir, f"transformer_checkpoint_{model.num_timesteps}.pth"),
+                             timesteps=model.num_timesteps)
+        print(f"[OK] final model saved: {final_path}")
+        print(f"View curves: tensorboard --logdir {tb_dir}")
+        return 0
+    finally:
+        env.close()
+        print("[OK] environment closed")
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="5 Q-network SAC, STT embedding + nav (MlpPolicy)")
+    parser.add_argument("--timesteps", type=int, default=1_000_000,
+                        help="TARGET TOTAL policy steps (on resume: trains target - checkpoint steps)")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="CARLA server port")
+    parser.add_argument("--log-dir", type=str, default="./logs/5q_stt", help="Run directory")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate (fresh runs; resume keeps the checkpoint's)")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument("--buffer-size", type=int, default=50000, help="Replay buffer size (fresh runs)")
+    parser.add_argument("--render", action="store_true", help="Camera window + spectator follows the car")
+    parser.add_argument("--num-npc", type=int, default=200, help="NPC vehicles in the full-traffic stage")
+    parser.add_argument("--num-pedestrians", type=int, default=200, help="Pedestrians in the full-traffic stage")
+    parser.add_argument("--warmup-steps", type=int, default=20000,
+                        help="Expert transitions put in the replay buffer before learning "
+                             "(skipped when a replay buffer is restored on resume)")
+    parser.add_argument("--start-stage", type=int, default=0, choices=range(FINAL_STAGE + 1),
+                        help="Curriculum stage to start from (a higher saved stage wins on resume)")
+    parser.add_argument("--no-curriculum", action="store_true",
+                        help=f"Train directly on the final stage ({FINAL_STAGE})")
+    parser.add_argument("--encoder-path", type=str, default=DEFAULT_ENCODER,
+                        help="Optional pretrained SpatioTemporalEncoder state_dict (fresh runs; on resume "
+                             "the run's saved transformer weights take precedence)")
+    parser.add_argument("--load-checkpoint", type=str, default=None,
+                        help="SAC .zip to resume from (replay buffer and transformer weights restored "
+                             "if saved beside it)")
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="5 Q-Network SAC with SpatioTemporal Transformer"
-    )
-    parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps")
-    parser.add_argument("--port", type=int, default=2000, help="CARLA server port")
-    parser.add_argument("--log-dir", type=str, default="./logs/5q_stt", help="Log directory")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
-    parser.add_argument("--buffer-size", type=int, default=50000, help="Replay buffer size")
-    parser.add_argument("--render", action="store_true", help="Enable rendering")
-    parser.add_argument("--num-npc", type=int, default=200, help="Number of NPC vehicles")
-    parser.add_argument("--num-pedestrians", type=int, default=200, help="Number of pedestrians")
-    parser.add_argument(
-        "--encoder-path",
-        type=str,
-        default="pretrained/st_encoder/st_encoder.pth",
-        help="Path to pretrained encoder checkpoint (default: pretrained/st_encoder/st_encoder.pth)"
-    )
-    parser.add_argument("--load-checkpoint", type=str, default=None,
-                        help="Path to a saved SAC .zip to resume training from "
-                             "(true continuation; replay buffer restored if a "
-                             "matching '*_replay_buffer.pkl' sits beside it). NOTE: "
-                             "the SpatioTemporal Transformer is not in the SAC .zip "
-                             "— use --encoder-path to restore the st_encoder.")
-
-    args = parser.parse_args()
-
-    train_5q_stt_sac(
-        timesteps=args.timesteps,
-        port=args.port,
-        log_dir=args.log_dir,
-        learning_rate=args.lr,
-        batch_size=args.batch_size,
-        buffer_size=args.buffer_size,
-        render=args.render,
-        num_npc=args.num_npc,
-        num_pedestrians=args.num_pedestrians,
-        encoder_path=args.encoder_path,
-        load_checkpoint=args.load_checkpoint
-    )
+    sys.exit(train(parse_args()))

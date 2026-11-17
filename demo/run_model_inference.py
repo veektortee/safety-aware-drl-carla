@@ -1,524 +1,254 @@
 """
-Demo Script: View and Test Trained SAC Models
+Demo: watch a trained SAC model drive in CARLA
 ==============================================
 
-Load pretrained SAC models from checkpoints and run inference in CARLA.
+Loads a model saved by one of the four experiments and runs deterministic episodes with the SAME
+wrapper stack as training:
 
-Supported Model Variants:
-  - 5cnn.zip    : 5-layer CNN feature extractor
-  - 2cnn.zip    : 2-layer CNN feature extractor
-  - 5stt.zip    : 5-block spatiotemporal transformer
-  - 2stt.zip    : 2-block spatiotemporal transformer
+    CarlaGymEnv -> CBFSafetyLayerWrapper -> CnnNavObservationWrapper   (CNN models, Dict observation)
+    CarlaGymEnv -> CBFSafetyLayerWrapper -> SttNavObservationWrapper   (STT models, vector observation)
+
+The variant is detected from the model's observation space. The camera window is shown and the
+spectator follows the car (disable with --no-render). One line is printed per episode.
+
+With the CBF enabled, the critic-ensemble trust score is computed from the loaded model at every
+step and fed to the safety layer, as PolicyTrustScoreCallback does during training (--no-trust
+keeps trust at 1.0). STT models need the run's transformer weights: they are found automatically in
+<log-dir>/checkpoints/transformer/ (or pass --transformer-path).
+
+A CARLA server must be running on --port.
 
 Usage:
-    python demo/run_model_inference.py --model 5cnn --episodes 3 --render
-    python demo/run_model_inference.py --model 2stt --episodes 5 --render --no-cbf
-    python demo/run_model_inference.py --model 2stt --episodes 3 --no-trust
+    python demo/run_model_inference.py --model-path logs/5q_cnn/sac_5q_cnn_final.zip --episodes 3
+    python demo/run_model_inference.py --model-path logs/2q_stt/checkpoints/sac_2q_stt_500000_steps.zip
+    python demo/run_model_inference.py --model 5cnn --checkpoint-dir demos     # demos/5cnn.zip
+    python demo/run_model_inference.py --model-path <zip> --no-cbf --fixed-spawns
     python demo/run_model_inference.py --list-models
-
-When the CBF layer is enabled, the critic-ensemble trust score is computed live
-from the loaded model at every step (trust = exp(-lambda * Var_k[Q_k])) and fed
-to the safety layer, mirroring the training-time PolicyTrustScoreCallback.
-Disable with --no-trust to run the CBF with a fixed trust of 1.0.
 """
 
-import os
-import sys
 import argparse
 import json
+import os
+import sys
+import time
 from pathlib import Path
 from typing import Optional
+
 import numpy as np
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
-try:
-    import carla
-except ImportError:
-    print("ERROR: CARLA module not found. Install via CARLA PythonAPI")
-    sys.exit(1)
-
-import torch as th
+from gymnasium import spaces
 from stable_baselines3 import SAC
-import gymnasium as gym
-from tests.pipeline_carla_test import (
-    CarlaGymEnv, 
-    PipelineObservationWrapper, 
-    CBFSafetyLayerWrapper,
-)
+
+from tests.pipeline_carla_test import CarlaGymEnv, CBFSafetyLayerWrapper, _compute_live_policy_metrics
+from commons.curriculum_stages import FINAL_STAGE, STAGES
+from commons.nav_layout import NAV_DIM
+from commons.obs_wrappers import CnnNavObservationWrapper, SttNavObservationWrapper, find_transformer_checkpoint
+
+LEGACY_MODELS = {
+    "5cnn": "SAC 5 critics, CNN",
+    "2cnn": "SAC 2 critics, CNN",
+    "5stt": "SAC 5 critics, SpatioTemporal Transformer",
+    "2stt": "SAC 2 critics, SpatioTemporal Transformer",
+}
 
 
-class ModelInferenceEngine:
-    """Load and run inference on trained SAC models"""
-    
-    # Model checkpoint directory
-    CHECKPOINT_DIR = "demos"
-    
-    # Model name mapping
-    MODEL_VARIANTS = {
-        "5cnn": {"name": "SAC-5CNN", "desc": "5-layer CNN feature extractor"},
-        "2cnn": {"name": "SAC-2CNN", "desc": "2-layer CNN feature extractor"},
-        "5stt": {"name": "SAC-5STT", "desc": "5-block Spatiotemporal Transformer"},
-        "2stt": {"name": "SAC-2STT", "desc": "2-block Spatiotemporal Transformer"},
+def _resolve(path: str) -> str:
+    """Relative paths: working directory first, then the repo root."""
+    p = Path(path)
+    if p.is_absolute() or p.exists():
+        return str(p)
+    alt = REPO_ROOT / path
+    return str(alt) if alt.exists() else str(p)
+
+
+def list_models(checkpoint_dir: str):
+    print(f"\nModels in {checkpoint_dir}:")
+    for key, desc in LEGACY_MODELS.items():
+        path = os.path.join(checkpoint_dir, f"{key}.zip")
+        status = f"{os.path.getsize(path) / 2**20:.1f} MB" if os.path.isfile(path) else "not found"
+        print(f"  {key:5s} | {desc:45s} | {status}")
+    print("\nAny experiment output also works: --model-path <log-dir>/sac_<tag>_final.zip\n")
+
+
+def find_cbf_wrapper(env) -> Optional[CBFSafetyLayerWrapper]:
+    while env is not None:
+        if isinstance(env, CBFSafetyLayerWrapper):
+            return env
+        env = getattr(env, "env", None)
+    return None
+
+
+def build_env(model, args, model_path: str):
+    """Same stack as training, chosen from the model's observation space."""
+    obs_space = model.observation_space
+    is_cnn = isinstance(obs_space, spaces.Dict) and "image" in obs_space.spaces
+    is_stt = isinstance(obs_space, spaces.Box) and len(obs_space.shape) == 1 and obs_space.shape[0] > NAV_DIM
+    if not (is_cnn or is_stt):
+        raise SystemExit(f"[ERROR] {model_path} has observation space {obs_space}; it was trained with the old "
+                         "env (before image+nav observations and [steer, accel] actions) and cannot run here.")
+    env = CarlaGymEnv(
+        host="localhost",
+        port=args.port,
+        timeout=10.0,
+        time_limit=3000,
+        render_mode=None if args.no_render else "human",
+        num_npc_vehicles=args.num_npc,
+        num_pedestrians=args.num_pedestrians,
+        show_sensor_data=not args.no_render,
+        curriculum_stage=args.stage,
+    )
+    if not args.no_cbf:
+        env = CBFSafetyLayerWrapper(env, use_trust_score=not args.no_trust)
+    if is_cnn:
+        size = int(obs_space.spaces["image"].shape[-1])
+        env = CnnNavObservationWrapper(env, size=size, occlusion=args.occlusion)
+        variant = f"CNN (image {size}x{size} + nav)"
+    else:
+        embed_dim = int(obs_space.shape[0]) - NAV_DIM
+        env = SttNavObservationWrapper(env, embed_dim=embed_dim, num_frames=8, occlusion=args.occlusion)
+        tpath = args.transformer_path or find_transformer_checkpoint(model_path)
+        if tpath:
+            env.load_transformer(tpath)
+            print(f"[SETUP] transformer weights: {tpath}")
+        else:
+            print("[SETUP] WARNING: no transformer_checkpoint_*.pth found for this model; the STT has new "
+                  "weights and the policy will see different embeddings than in training (use --transformer-path)")
+        variant = f"STT (embedding {embed_dim} + nav)"
+    return env, variant
+
+
+def run_episode(model, env, cbf_wrapper, use_trust: bool, reset_options: Optional[dict]) -> dict:
+    obs, info = env.reset(options=reset_options)
+    done = False
+    ep_return, steps, trust_values = 0.0, 0, []
+    while not done:
+        action, _ = model.predict(obs, deterministic=True)
+        if cbf_wrapper is not None and use_trust:
+            _, trust = _compute_live_policy_metrics(model, obs)
+            if trust is not None:
+                cbf_wrapper.set_trust_score(trust)
+                trust_values.append(trust)
+        obs, reward, terminated, truncated, info = env.step(action)
+        ep_return += float(reward)
+        steps += 1
+        done = bool(terminated or truncated)
+
+    metrics = info.get("episode_metrics")
+    if not (isinstance(metrics, dict) and "end_reason" in metrics):
+        metrics = {}
+    end_reason = (metrics.get("end_reason") or info.get("terminated_reason")
+                  or info.get("truncated_reason") or "unknown")
+    return {
+        "end_reason": end_reason,
+        "route_completion_frac": float(metrics.get("route_completion_frac", info.get("route_completion_frac", 0.0))),
+        "collisions": int(metrics.get("collisions", 0)),
+        "collisions_pedestrian": int(metrics.get("collisions_pedestrian", 0)),
+        "return": float(metrics.get("return", ep_return)),
+        "length_steps": int(metrics.get("length_steps", steps)),
+        "distance_m": float(metrics.get("distance_m", 0.0)),
+        "mean_speed_mps": float(metrics.get("mean_speed_mps", 0.0)),
+        "route_length_m": float(metrics.get("route_length_m", 0.0)),
+        "red_light_violations": int(metrics.get("red_light_violations", 0)),
+        "cbf_intervention_frac": float(metrics.get("cbf_intervention_frac", 0.0)),
+        "trust_mean": float(np.mean(trust_values)) if trust_values else None,
     }
-    
-    def __init__(
-        self,
-        model_name: str,
-        checkpoint_dir: str = None,
-        use_cuda: bool = True,
-        use_cbf: bool = True,
-        use_trust: bool = True,
-    ):
-        """Initialize inference engine"""
-        self.model_name = model_name
-        self.use_trust = use_trust
-        self.trust_scores = []
-        
-        # Fix checkpoint path - handle both relative and absolute paths
-        if checkpoint_dir is None:
-            checkpoint_dir = self.CHECKPOINT_DIR
-        
-        # If relative path, resolve from parent directory (not demo/)
-        if not os.path.isabs(checkpoint_dir) and not checkpoint_dir.startswith('..'):
-            # We're in demo folder, go up one level
-            checkpoint_dir = os.path.join('..', checkpoint_dir)
-        
-        self.checkpoint_dir = os.path.abspath(checkpoint_dir)
-        self.use_cuda = use_cuda
-        self.use_cbf = use_cbf
-        self.model = None
-        self.env = None
-        self.device = "cuda" if use_cuda else "cpu"
-        
-        # Stats tracking
-        self.episode_rewards = []
-        self.episode_lengths = []
-        self.episode_collisions = []
-        self.episode_waypoints = []
-    
-    def list_available_models(self) -> dict:
-        """List all available checkpoint models"""
-        print("\n" + "="*70)
-        print("AVAILABLE MODELS")
-        print("="*70)
-        
-        for model_id, info in self.MODEL_VARIANTS.items():
-            checkpoint_path = os.path.join(self.checkpoint_dir, f"{model_id}.zip")
-            exists = os.path.exists(checkpoint_path)
-            status = "✓ Available" if exists else "✗ Not found"
-            print(f"  {model_id:8s} | {info['name']:30s} | {status}")
-            print(f"           | {info['desc']:30s} |")
-            if exists:
-                size_mb = os.path.getsize(checkpoint_path) / (1024*1024)
-                print(f"           | Size: {size_mb:.2f} MB                      |")
-            print()
-        
-        print("="*70 + "\n")
-        return self.MODEL_VARIANTS
-    
-    def load_model(self) -> bool:
-        """Load model checkpoint"""
-        checkpoint_path = os.path.join(self.checkpoint_dir, f"{self.model_name}.zip")
-        
-        print(f"[DEBUG] Checkpoint directory: {self.checkpoint_dir}")
-        print(f"[DEBUG] Looking for: {checkpoint_path}")
-        
-        # Check if file exists
-        if not os.path.exists(checkpoint_path):
-            print(f"[ERROR] Model not found: {checkpoint_path}")
-            print(f"[ERROR] Directory exists: {os.path.isdir(self.checkpoint_dir)}")
-            
-            # List available files in directory
-            if os.path.isdir(self.checkpoint_dir):
-                files = os.listdir(self.checkpoint_dir)
-                print(f"[ERROR] Files in {self.checkpoint_dir}: {files}")
-            return False
-        
-        # Check file is readable
-        if not os.access(checkpoint_path, os.R_OK):
-            print(f"[ERROR] Model file not readable: {checkpoint_path}")
-            return False
-        
-        print(f"[INFO] Loading model from: {checkpoint_path}")
-        print(f"[INFO] File size: {os.path.getsize(checkpoint_path) / (1024*1024):.2f} MB")
-        
-        try:
-            # Create environment for model loading
-            print("[SETUP] Creating CARLA environment...")
-            self.env = self._create_env()
-            
-            # Load SAC model
-            model_path = checkpoint_path.replace(".zip", "")
-            print(f"[INFO] Loading SAC model from: {model_path}")
-            self.model = SAC.load(
-                model_path,
-                env=self.env,
-                device=self.device,
-            )
-            
-            print(f"[OK] Model loaded successfully")
-            print(f"     Policy: {self.model.policy}")
-            print(f"     Device: {self.device}")
-            return True
-            
-        except Exception as e:
-            print(f"[ERROR] Failed to load model: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-    
-    def _create_env(self) -> gym.Env:
-        """Create CARLA environment with pipeline"""
-        print("[SETUP] Creating CARLA environment...")
-        
-        env = CarlaGymEnv(
-            time_limit=300,
-            render_mode="human",
-            num_npc_vehicles=50,
-            num_pedestrians=15,
-            show_sensor_data=False
-        )
-        
-        # Add pipeline wrapper
-        env = PipelineObservationWrapper(env, embed_dim=512, num_frames=8)
-        
-        # Optionally add CBF safety layer
-        if self.use_cbf:
-            print(f"[SETUP] Adding CBF Safety Layer (trust modulation: {self.use_trust})...")
-            env = CBFSafetyLayerWrapper(env, alpha=1.0, use_trust_score=self.use_trust)
-
-        return env
-
-    def _update_trust_score(self, obs) -> Optional[float]:
-        """Compute ensemble trust from the loaded model and push it to the CBF layer.
-
-        Mirrors the training-time PolicyTrustScoreCallback: evaluate the
-        deterministic actor action under the K-critic ensemble, take the
-        variance across critics, and map it to trust = exp(-lambda * variance).
-        """
-        if not (self.use_cbf and self.use_trust):
-            return None
-        try:
-            obs_tensor, _ = self.model.policy.obs_to_tensor(obs)
-            with th.no_grad():
-                policy_action = self.model.actor(obs_tensor, deterministic=True)
-                _, uncertainty, trust = self.model.critic.predict(obs_tensor, policy_action)
-            trust_value = float(trust.mean().item())
-            if hasattr(self.env, "set_trust_score"):
-                self.env.set_trust_score(trust_value)
-            self.trust_scores.append(trust_value)
-            return trust_value
-        except Exception as e:
-            print(f"[WARN] Trust-score update failed: {e}")
-            return None
-    
-    def run_inference_episode(self, episode_num: int = 1, verbose: bool = True) -> dict:
-        """Run single inference episode"""
-        if self.model is None or self.env is None:
-            print("[ERROR] Model not loaded. Call load_model() first.")
-            return {}
-        
-        print(f"\n{'='*70}")
-        print(f"EPISODE {episode_num} - Inference")
-        print(f"{'='*70}")
-        print(f"Model: {self.MODEL_VARIANTS[self.model_name]['name']}")
-        print(f"CBF Safety: {'Enabled' if self.use_cbf else 'Disabled'}")
-        print(f"{'='*70}\n")
-        
-        # Reset environment
-        obs, info = self.env.reset()
-        terminated = False
-        truncated = False
-        total_reward = 0.0
-        step = 0
-        episode_trust = []
-
-        # Episode loop
-        while not (terminated or truncated):
-            try:
-                # Get action from model (deterministic mode)
-                action, _ = self.model.predict(obs, deterministic=True)
-
-                # Live trust score from the critic ensemble -> CBF layer
-                trust_value = self._update_trust_score(obs)
-                if trust_value is not None:
-                    episode_trust.append(trust_value)
-
-                # Step environment
-                obs, reward, terminated, truncated, info = self.env.step(action)
-                
-                total_reward += reward
-                step += 1
-                
-                # Log info every 50 steps
-                if verbose and step % 50 == 0:
-                    speed = obs[0] if hasattr(obs, '__len__') else 0  # Approximate
-                    trust_str = f" | Trust: {episode_trust[-1]:.3f}" if episode_trust else ""
-                    print(f"[Step {step:3d}] Reward: {reward:8.4f} | Total: {total_reward:10.4f}{trust_str}")
-                    
-                    # Print environment info if available
-                    if hasattr(self.env.unwrapped, 'waypoints_crossed'):
-                        wp = self.env.unwrapped.waypoints_crossed
-                        total_wp = self.env.unwrapped.total_waypoints
-                        dist = self.env.unwrapped._compute_collision_distance()
-                        print(f"           | Waypoints: {wp}/{total_wp} | Collision Distance: {dist:.2f}m")
-                
-            except KeyboardInterrupt:
-                print("\n[INTERRUPTED] Episode stopped by user")
-                terminated = True
-                break
-            except Exception as e:
-                print(f"[ERROR] Step {step}: {e}")
-                break
-        
-        # Collect episode stats
-        stats = {
-            'episode_num': episode_num,
-            'model': self.model_name,
-            'total_reward': total_reward,
-            'episode_length': step,
-            'cbf_enabled': self.use_cbf,
-            'trust_enabled': self.use_cbf and self.use_trust,
-        }
-        if episode_trust:
-            stats['mean_trust_score'] = float(np.mean(episode_trust))
-            stats['min_trust_score'] = float(np.min(episode_trust))
-            stats['max_trust_score'] = float(np.max(episode_trust))
-        
-        # Get environment stats if available
-        if hasattr(self.env.unwrapped, '_collision_count'):
-            stats['collisions'] = self.env.unwrapped._collision_count
-        if hasattr(self.env.unwrapped, 'waypoints_crossed'):
-            stats['waypoints_crossed'] = self.env.unwrapped.waypoints_crossed
-        if hasattr(self.env.unwrapped, '_cbf_correction_count_episode'):
-            stats['cbf_corrections'] = self.env.unwrapped._cbf_correction_count_episode
-        
-        # Print episode summary
-        print(f"\n{'='*70}")
-        print("EPISODE SUMMARY")
-        print(f"{'='*70}")
-        print(f"Total Reward:      {total_reward:10.4f}")
-        print(f"Episode Length:    {step:10d} steps")
-        if 'collisions' in stats:
-            print(f"Collisions:        {stats['collisions']:10d}")
-        if 'waypoints_crossed' in stats:
-            print(f"Waypoints Crossed: {stats['waypoints_crossed']:10d}")
-        if 'cbf_corrections' in stats:
-            print(f"CBF Corrections:   {stats['cbf_corrections']:10d}")
-        if 'mean_trust_score' in stats:
-            print(f"Trust (mean/min/max): {stats['mean_trust_score']:.3f} / "
-                  f"{stats['min_trust_score']:.3f} / {stats['max_trust_score']:.3f}")
-        print(f"{'='*70}\n")
-        
-        self.episode_rewards.append(total_reward)
-        self.episode_lengths.append(step)
-        if 'collisions' in stats:
-            self.episode_collisions.append(stats['collisions'])
-        if 'waypoints_crossed' in stats:
-            self.episode_waypoints.append(stats['waypoints_crossed'])
-        
-        return stats
-    
-    def run_inference_episodes(self, num_episodes: int = 3, verbose: bool = True) -> list:
-        """Run multiple inference episodes"""
-        results = []
-        
-        for episode_idx in range(num_episodes):
-            try:
-                stats = self.run_inference_episode(episode_num=episode_idx + 1, verbose=verbose)
-                results.append(stats)
-            except Exception as e:
-                print(f"[ERROR] Episode {episode_idx + 1} failed: {e}")
-                continue
-        
-        # Print overall statistics
-        self._print_summary(results)
-        return results
-    
-    def _print_summary(self, results: list):
-        """Print summary statistics across all episodes"""
-        if not results:
-            print("[ERROR] No episodes completed")
-            return
-        
-        rewards = [r['total_reward'] for r in results]
-        lengths = [r['episode_length'] for r in results]
-        
-        print(f"\n{'='*70}")
-        print("INFERENCE SUMMARY")
-        print(f"{'='*70}")
-        print(f"Model:              {self.MODEL_VARIANTS[self.model_name]['name']}")
-        print(f"Episodes Completed: {len(results)}/{len(results)}")
-        print(f"\nReward Statistics:")
-        print(f"  Mean:             {np.mean(rewards):10.4f}")
-        print(f"  Std:              {np.std(rewards):10.4f}")
-        print(f"  Min:              {np.min(rewards):10.4f}")
-        print(f"  Max:              {np.max(rewards):10.4f}")
-        print(f"\nLength Statistics:")
-        print(f"  Mean:             {np.mean(lengths):10.2f} steps")
-        print(f"  Std:              {np.std(lengths):10.2f} steps")
-        print(f"  Min:              {np.min(lengths):10d} steps")
-        print(f"  Max:              {np.max(lengths):10d} steps")
-        
-        if self.episode_collisions:
-            print(f"\nSafety Statistics:")
-            print(f"  Total Collisions: {sum(self.episode_collisions)}")
-            print(f"  Mean per Ep:      {np.mean(self.episode_collisions):10.2f}")
-        
-        if self.episode_waypoints:
-            print(f"\nNavigation Statistics:")
-            print(f"  Mean Waypoints:   {np.mean(self.episode_waypoints):10.2f}")
-            print(f"  Total Waypoints:  {sum(self.episode_waypoints)}")
-        
-        print(f"{'='*70}\n")
-    
-    def cleanup(self):
-        """Cleanup resources"""
-        if self.env is not None:
-            try:
-                self.env.close()
-            except:
-                pass
-        print("[OK] Cleanup complete")
 
 
-# ============================================================================
-# CLI Interface
-# ============================================================================
+def format_line(i: int, n: int, r: dict) -> str:
+    trust = f" | trust {r['trust_mean']:.2f}" if r["trust_mean"] is not None else ""
+    ped = f" (pedestrian {r['collisions_pedestrian']})" if r["collisions_pedestrian"] else ""
+    return (f"ep {i}/{n} | END {r['end_reason']:<20s} | route {r['route_completion_frac']:4.0%} | "
+            f"collisions {r['collisions']}{ped} | R {r['return']:+8.1f} | {r['length_steps']} steps "
+            f"{r['distance_m'] / 1000:.2f} km | {r['mean_speed_mps']:.1f} m/s | cbf {r['cbf_intervention_frac']:.0%}{trust}")
 
-def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(
-        description="View and test trained SAC models in CARLA",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  
-  View available models:
-    python demo/run_model_inference.py --list-models
-  
-  Run inference with 5CNN model (3 episodes):
-    python demo/run_model_inference.py --model 5cnn --episodes 3
-  
-  Test 2STT model with CBF disabled:
-    python demo/run_model_inference.py --model 2stt --episodes 1 --no-cbf
-  
-  Test all models (1 episode each):
-    python demo/run_model_inference.py --model 5cnn --episodes 1
-    python demo/run_model_inference.py --model 2cnn --episodes 1
-    python demo/run_model_inference.py --model 5stt --episodes 1
-    python demo/run_model_inference.py --model 2stt --episodes 1
-        """
-    )
-    
-    parser.add_argument(
-        "--model",
-        type=str,
-        choices=["5cnn", "2cnn", "5stt", "2stt"],
-        default="5cnn",
-        help="Model variant to test (default: 5cnn)"
-    )
-    
-    parser.add_argument(
-        "--episodes",
-        type=int,
-        default=3,
-        help="Number of inference episodes to run (default: 3)"
-    )
-    
-    parser.add_argument(
-        "--checkpoint-dir",
-        type=str,
-        default="demos",
-        help="Directory containing model checkpoints (default: demos/checkpoints)"
-    )
-    
-    parser.add_argument(
-        "--no-cbf",
-        action="store_true",
-        help="Disable CBF safety layer during inference"
-    )
 
-    parser.add_argument(
-        "--no-trust",
-        action="store_true",
-        help="Disable live trust-score modulation of the CBF layer (trust fixed at 1.0)"
-    )
-    
-    parser.add_argument(
-        "--cpu",
-        action="store_true",
-        help="Use CPU instead of GPU"
-    )
-    
-    parser.add_argument(
-        "--list-models",
-        action="store_true",
-        help="List all available model variants and exit"
-    )
-    
-    parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress verbose output"
-    )
-    
-    args = parser.parse_args()
-    
-    # Initialize inference engine
-    engine = ModelInferenceEngine(
-        model_name=args.model,
-        checkpoint_dir=args.checkpoint_dir,
-        use_cuda=not args.cpu,
-        use_cbf=not args.no_cbf,
-        use_trust=not args.no_trust,
-    )
-    
-    # List models if requested
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Run a trained SAC model in CARLA (deterministic, visible)",
+                                     formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    parser.add_argument("--model-path", type=str, default=None, help="SAC .zip saved by an experiment")
+    parser.add_argument("--model", type=str, choices=list(LEGACY_MODELS), default="5cnn",
+                        help="Legacy name, used when --model-path is not given: loads "
+                             "<checkpoint-dir>/<model>.zip (default 5cnn)")
+    parser.add_argument("--checkpoint-dir", type=str, default="demos", help="Folder for --model / --list-models")
+    parser.add_argument("--episodes", type=int, default=3, help="Number of episodes")
+    parser.add_argument("--port", type=int, default=2000, help="CARLA server port")
+    parser.add_argument("--num-npc", type=int, default=50, help="NPC vehicles (final stage)")
+    parser.add_argument("--num-pedestrians", type=int, default=15, help="Pedestrians (final stage)")
+    parser.add_argument("--stage", type=int, default=FINAL_STAGE, choices=range(FINAL_STAGE + 1),
+                        help=f"Curriculum stage of the scenario (default {FINAL_STAGE}: full traffic)")
+    parser.add_argument("--fixed-spawns", action="store_true",
+                        help="Episode i uses spawn_index=i, route_seed=i (repeatable, like evaluation)")
+    parser.add_argument("--occlusion", type=str, default="none",
+                        choices=["none", "mixed", "black_bars", "white_noise"],
+                        help="Camera occlusions as in training (default none)")
+    parser.add_argument("--transformer-path", type=str, default=None, help="STT weights (auto-detected if omitted)")
+    parser.add_argument("--no-cbf", action="store_true", help="Run without the CBF safety layer")
+    parser.add_argument("--no-trust", action="store_true", help="CBF with a fixed trust of 1.0")
+    parser.add_argument("--no-render", action="store_true", help="No camera window / spectator follow")
+    parser.add_argument("--cpu", action="store_true", help="Run the policy on the CPU")
+    parser.add_argument("--list-models", action="store_true", help="List legacy models in --checkpoint-dir")
+    parser.add_argument("--quiet", action="store_true", help="Only print the per-episode lines and the summary")
+    parser.add_argument("--results", type=str, default=None,
+                        help="JSON output (default demo/results_<model>_<episodes>eps.json)")
+    args = parser.parse_args(argv)
+
+    checkpoint_dir = _resolve(args.checkpoint_dir)
     if args.list_models:
-        engine.list_available_models()
-        return
-    
-    # Print banner
-    print("\n" + "="*70)
-    print("SAC MODEL INFERENCE - CARLA")
-    print("="*70)
-    print(f"Model:           {engine.MODEL_VARIANTS[args.model]['name']}")
-    print(f"Description:     {engine.MODEL_VARIANTS[args.model]['desc']}")
-    print(f"Episodes:        {args.episodes}")
-    print(f"CBF Safety:      {'Enabled' if not args.no_cbf else 'Disabled'}")
-    print(f"Device:          {'GPU' if not args.cpu else 'CPU'}")
-    print("="*70 + "\n")
-    
-    # Load model
-    if not engine.load_model():
-        print("[ERROR] Failed to load model. Exiting.")
-        return
-    
-    # Run inference
+        list_models(checkpoint_dir)
+        return 0
+    if args.model_path:
+        model_path = _resolve(args.model_path)
+    else:
+        model_path = os.path.join(checkpoint_dir, f"{args.model}.zip")
+    if not os.path.isfile(model_path):
+        print(f"[ERROR] model not found: {model_path} (pass --model-path <zip>)")
+        return 1
+
+    device = "cpu" if args.cpu else "auto"
+    print(f"[SETUP] loading {model_path}")
+    model = SAC.load(model_path, device=device)
+    env, variant = build_env(model, args, model_path)
+    cbf_wrapper = find_cbf_wrapper(env)
+    if not args.quiet:
+        print("=" * 100)
+        print(f"model {Path(model_path).name} | {variant} | critics {model.critic.n_critics} | "
+              f"stage {args.stage} {STAGES[args.stage]['name']} | CBF {'off' if args.no_cbf else 'on'}"
+              f"{'' if args.no_cbf else (' (trust fixed 1.0)' if args.no_trust else ' (live trust)')} | "
+              f"occlusion {args.occlusion}")
+        print("=" * 100)
+
+    results = []
     try:
-        results = engine.run_inference_episodes(
-            num_episodes=args.episodes,
-            verbose=not args.quiet
-        )
-        
-        # Save results
-        results_file = f"demo/results_{args.model}_{args.episodes}eps.json"
-        with open(results_file, 'w') as f:
-            json.dump(results, f, indent=2)
-        print(f"[OK] Results saved to: {results_file}\n")
-        
+        for i in range(args.episodes):
+            options = {"spawn_index": i, "route_seed": i} if args.fixed_spawns else None
+            t0 = time.time()
+            r = run_episode(model, env, cbf_wrapper, use_trust=not args.no_trust, reset_options=options)
+            r["episode"] = i + 1
+            r["wall_s"] = round(time.time() - t0, 1)
+            results.append(r)
+            print(format_line(i + 1, args.episodes, r), flush=True)
     except KeyboardInterrupt:
-        print("\n[INTERRUPTED] Inference stopped by user")
-    except Exception as e:
-        print(f"[ERROR] Inference failed: {e}")
-        import traceback
-        traceback.print_exc()
+        print("\n[INTERRUPT] stopped by user")
     finally:
-        engine.cleanup()
+        env.close()
+
+    if results:
+        n = len(results)
+        success = sum(r["end_reason"] == "endpoint" for r in results)
+        print("-" * 100)
+        print(f"{n} episodes | success {success}/{n} | route {np.mean([r['route_completion_frac'] for r in results]):.0%} "
+              f"(mean) | collisions {sum(r['collisions'] for r in results)} | "
+              f"return {np.mean([r['return'] for r in results]):+.1f} (mean)")
+        out = args.results or str(REPO_ROOT / "demo" / f"results_{Path(model_path).stem}_{n}eps.json")
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump({"model": model_path, "variant": variant, "stage": args.stage, "cbf": not args.no_cbf,
+                       "trust": not (args.no_cbf or args.no_trust), "episodes": results}, f, indent=2)
+        print(f"[OK] results saved to {out}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
