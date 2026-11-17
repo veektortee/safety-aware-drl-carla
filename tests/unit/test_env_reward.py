@@ -357,8 +357,9 @@ def test_speed_limit_and_episode_limit():
     assert close(env_mod.clip_speed_limit(30.0), 30.0 / 3.6)
     assert env_mod.clip_speed_limit(0.0) == 5.0
     assert env_mod.clip_speed_limit(200.0) == 25.0
-    assert abs(env_mod.episode_step_limit(300.0, 30.0 / 3.6, 3000) - 1800) <= 1   # 300 / (0.4 * 8.33) / 0.05
-    assert env_mod.episode_step_limit(80.0, 25.0, 3000) == 600
+    assert abs(env_mod.episode_step_limit(200.0, 30.0 / 3.6, 4000) - 2400) <= 1   # (200 / (0.4 * 8.33) + 60) / 0.05
+    assert env_mod.episode_step_limit(80.0, 25.0, 3000) == 1360                    # (80 / 10 + 60) / 0.05
+    assert env_mod.episode_step_limit(10.0, 25.0, 3000) >= 600
     assert env_mod.episode_step_limit(5000.0, 5.0, 3000) == 3000
 
 
