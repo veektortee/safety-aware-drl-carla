@@ -1,520 +1,250 @@
 """
-5 Q-Networks SAC CNN-only (No SpatioTemporal Transformer)
-- Architecture: ResNet50 + CNN policy (no STT)
-- Q-network ensemble: 5 critics (higher uncertainty estimation)
-- 200 NPC vehicles + 200 pedestrians
-- Random occlusions (30% of episodes)
-- Waypoint logging (junctions, merges, lane changes)
-- Reverse reward for collision recovery
+5 Q-network SAC, CNN variant (no SpatioTemporal Transformer)
+
+Stack:
+    CarlaGymEnv              obs Dict(rgb_data 360x640x3, nav), action [steer, accel] in [-1, 1]^2
+      -> CBFSafetyLayerWrapper    discrete-time CBF QP; trust from the critic ensemble tightens it
+      -> CnnNavObservationWrapper image (3, 84, 84) uint8 + nav vector; occlusions in 30% of episodes
+    SAC 'MultiInputPolicy' (NatureCNN on the image + flattened nav), ensemble of 5 critics.
+
+Training: the replay buffer is first filled with expert-driver transitions (--warmup-steps), then
+SAC learns (learning_starts=1000). The curriculum S0..S3 (commons/curriculum_stages.py) is promoted
+automatically unless --no-curriculum. A CARLA server must be running on --port.
 
 Usage:
-    python 5qCNNsac_experiment.py --timesteps 100000 --render
-    python 5qCNNsac_experiment.py --timesteps 50000 --log-dir ./logs/5q_cnn_v1
+    python experiments/5qCNNsac_experiment.py --render
+    python experiments/5qCNNsac_experiment.py --timesteps 1000000 --log-dir ./logs/5q_cnn
+    python experiments/5qCNNsac_experiment.py --load-checkpoint ./logs/5q_cnn/checkpoints/sac_5q_cnn_250000_steps.zip
+
+--timesteps is the TARGET TOTAL: resuming a 250k checkpoint with --timesteps 1000000 trains 750k
+more steps. Expert warm-up steps are not counted.
 """
 
+import argparse
 import os
 import sys
-import argparse
-import numpy as np
-import torch
-import cv2
+import traceback
 from pathlib import Path
-from datetime import datetime
 
-# Add project paths
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import gymnasium as gym
-from gymnasium import spaces
 from stable_baselines3 import SAC
-from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
+from stable_baselines3.common.callbacks import CheckpointCallback, LogEveryNTimesteps
 from stable_baselines3.common.logger import configure
 
-import carla
-
-from tests.pipeline_carla_test import (
-    CarlaGymEnv,
-    CBFSafetyLayerWrapper,
-    ComprehensiveMetricsLoggingCallback,
-    PolicyTrustScoreCallback,
+from tests.pipeline_carla_test import CarlaGymEnv, CBFSafetyLayerWrapper, PolicyTrustScoreCallback
+from commons.metrics_callbacks import EpisodeMetricsCallback, EvalCallback, write_run_config
+from commons.obs_wrappers import CnnNavObservationWrapper
+from commons.curriculum import CurriculumCallback, resolve_start_stage
+from commons.curriculum_stages import FINAL_STAGE
+from commons.warmup import (
+    checkpoint_num_timesteps,
+    describe_env_stack,
+    prefill_replay_buffer,
+    restore_replay_buffer,
+    save_checkpoint,
 )
-from experiments.occlusions import OcclusionStrategy
-from experiments.waypoint_logger import WaypointContextLogger
+
+EXPERIMENT = "5q_cnn"
+NAME_PREFIX = "sac_5q_cnn"
+POLICY = "MultiInputPolicy"
+N_CRITICS = 5
+TIME_LIMIT = 3000          # upper bound; the env derives a shorter per-route limit
+LEARNING_STARTS = 1000
+SAVE_FREQ = 25000
+EVAL_FREQ = 25000
+EVAL_EPISODES = 10
+SB3_TABLE_EVERY = 1000     # steps between SB3 stdout tables (train/* losses)
+OCCLUSION = "mixed"
 
 
-class ImageObservationWrapper(gym.ObservationWrapper):
-    """Wraps observation dict to (C, H, W) format for CNN policy."""
-
-    def __init__(self, env):
-        super().__init__(env)
-        self.env = env
-        # CNN expects (C, H, W) format as Box observation space
-        self.observation_space = spaces.Box(
-            low=0,
-            high=255,
-            shape=(3, 84, 84),  # RGB, 84x84 (standard Atari-like size)
-            dtype=np.uint8
-        )
-
-    def observation(self, obs):
-        """Convert dict obs with 'rgb_data' to (C, H, W) uint8 tensor."""
-        # Handle dict observation (from CarlaGymEnv or wrapped environment)
-        if isinstance(obs, dict):
-            rgb = obs.get('rgb_data')
-            if rgb is None:
-                # Return black image if no RGB data
-                return np.zeros((3, 84, 84), dtype=np.uint8)
-        else:
-            # If already an array, assume it's RGB in HWC format
-            rgb = obs
-        
-        # Ensure uint8
-        if rgb.dtype != np.uint8:
-            rgb = (np.clip(rgb, 0, 255)).astype(np.uint8)
-        
-        # Convert HWC to (3, H, W) if needed
-        if rgb.ndim == 3 and rgb.shape[2] in (3, 4):  # HWC format
-            if rgb.shape[2] == 4:
-                rgb = rgb[:, :, :3]  # Drop alpha channel if present
-            rgb = np.transpose(rgb, (2, 0, 1))  # HWC -> CHW
-        elif rgb.ndim == 2:  # Grayscale
-            rgb = np.stack([rgb, rgb, rgb], axis=0)
-        
-        # Resize to 84x84 if needed
-        if rgb.shape[1] != 84 or rgb.shape[2] != 84:
-            rgb_reshaped = np.transpose(rgb, (1, 2, 0))  # CHW -> HWC for cv2
-            rgb_resized = cv2.resize(rgb_reshaped, (84, 84), interpolation=cv2.INTER_LINEAR)
-            rgb = np.transpose(rgb_resized, (2, 0, 1))  # HWC -> CHW
-        
-        return rgb.astype(np.uint8)
-
-
-class LocationContextWrapper(gym.Wrapper):
-    """Log waypoint context during episodes"""
-    
-    def __init__(self, env, carla_map):
-        super().__init__(env)
-        self.carla_map = carla_map
-        self.waypoint_logger = WaypointContextLogger()
-    
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        
-        # Log waypoint context
-        if hasattr(self.env.unwrapped, 'ego_vehicle'):
-            vehicle = self.env.unwrapped.ego_vehicle
-            location = vehicle.get_location()
-            context = self.waypoint_logger.log_waypoint(self.carla_map, location)
-            
-            if context.get('valid'):
-                # Add event-based reward
-                if context.get('event') == 'JUNCTION':
-                    info['location_event'] = 'junction'
-                elif 'MERGE' in context.get('event', ''):
-                    info['location_event'] = 'merge'
-                elif 'LANE_CHANGE' in context.get('event', ''):
-                    info['location_event'] = 'lane_change'
-        
-        return obs, reward, terminated, truncated, info
-    
-    def reset(self, **kwargs):
-        self.waypoint_logger.reset_episode()
-        return self.env.reset(**kwargs)
-
-
-class OcclusionWrapper(gym.ObservationWrapper):
-    """Apply random occlusions to observations"""
-    
-    def __init__(self, env, occlusion_type='mixed'):
-        super().__init__(env)
-        self.occlusion = OcclusionStrategy(occlusion_type)
-    
-    def observation(self, obs):
-        return self.occlusion.apply(obs)
-    
-    def reset(self, **kwargs):
-        self.occlusion.reset_episode()
-        result = self.env.reset(**kwargs)
-        if isinstance(result, tuple):
-            obs, info = result
-            return self.occlusion.apply(obs), info
-        else:
-            return self.occlusion.apply(result)
-
-
-class ReversalRewardCallback(BaseCallback):
-    """Reward reversing after collision for recovery learning"""
-    
-    def __init__(self, verbose=0):
-        super().__init__(verbose)
-        self.collision_happened = False
-    
-    def _on_step(self) -> bool:
-        return True
-
-
-class SafetyMetricsCallback(BaseCallback):
-    """Log safety metrics to TensorBoard"""
-    
-    def __init__(self, verbose=0):
-        super().__init__(verbose)
-        self.collision_count = 0
-        self.lane_invasion_count = 0
-    
-    def _on_step(self) -> bool:
-        # Log metrics every 100 steps
-        if self.num_timesteps % 100 == 0:
-            try:
-                env = self.training_env.envs[0].unwrapped
-                if hasattr(env, 'safety_metrics'):
-                    metrics = env.safety_metrics
-                    # Collision tracking (Phase 5)
-                    self.logger.record("safety/collisions_episode", metrics.get('collisions', 0))
-                    self.logger.record("safety/lane_invasions", metrics.get('lane_invasions', 0))
-                    # CBF corrections - per-episode (Phase 5)
-                    self.logger.record("safety/cbf_corrections_episode", metrics.get('cbf_corrections_episode', 0))
-                    self.logger.record("safety/cbf_correction_magnitude", metrics.get('cbf_correction_magnitude', 0.0))
-                    # Waypoint completion - normalized 0-1 (Phase 5)
-                    self.logger.record("navigation/waypoint_completion_ratio", metrics.get('waypoint_completion', 0.0))
-                    self.logger.record("navigation/waypoints_crossed", metrics.get('waypoints_crossed', 0))
-                    self.logger.record("navigation/total_waypoints", metrics.get('total_waypoints', 0))
-                    # Endpoint detection (Phase 5)
-                    self.logger.record("navigation/endpoint_distance", metrics.get('endpoint_distance', 9999.0))
-                    self.logger.record("navigation/endpoint_reached", metrics.get('endpoint_reached', 0.0))
-            except:
-                pass
-        
-        return True
-
-
-class TrustScoreCallback(BaseCallback):
-    """Compute policy trust score from entropy and pass to CBF layer"""
-    
-    def __init__(self, update_freq: int = 100, verbose: int = 0):
-        super().__init__(verbose)
-        self.update_freq = update_freq
-        self.current_trust = 1.0
-    
-    def _on_step(self) -> bool:
-        # Update trust score periodically
-        if self.num_timesteps % self.update_freq == 0:
-            try:
-                # Compute policy entropy (higher entropy = less confident)
-                if hasattr(self.model, 'ent_coef'):
-                    # SAC's entropy coefficient (auto-adjusted by algorithm)
-                    if isinstance(self.model.ent_coef, torch.Tensor):
-                        ent_coef = self.model.ent_coef.detach().cpu().item()
-                    elif isinstance(self.model.ent_coef, str) and self.model.ent_coef == 'auto':
-                        # Auto entropy tuning - use learned ent_coef_target instead
-                        ent_coef = self.model.ent_coef_target if hasattr(self.model, 'ent_coef_target') else 0.1
-                    else:
-                        ent_coef = float(self.model.ent_coef)
-                    
-                    # Map entropy coef to trust: lower entropy = higher trust
-                    # ent_coef range typically [0.01, 0.5], map to trust [0.0, 1.0]
-                    self.current_trust = 1.0 - np.clip(ent_coef * 2.0, 0.0, 1.0)
-                else:
-                    self.current_trust = 0.8  # Default moderate trust
-                
-                # Find CBFSafetyLayerWrapper in environment stack
-                env = self.training_env
-                cbf_wrapper = None
-                
-                # For VecEnv (vectorized environments)
-                if hasattr(env, 'envs'):
-                    for single_env in env.envs:
-                        current = single_env
-                        while hasattr(current, 'env'):
-                            if hasattr(current, 'set_trust_score'):
-                                cbf_wrapper = current
-                                break
-                            current = current.env
-                        if cbf_wrapper:
-                            break
-                else:
-                    # Single environment
-                    current = env
-                    while hasattr(current, 'env'):
-                        if hasattr(current, 'set_trust_score'):
-                            cbf_wrapper = current
-                            break
-                        current = current.env
-                
-                # Update CBF wrapper if found
-                if cbf_wrapper is not None:
-                    cbf_wrapper.set_trust_score(self.current_trust)
-                    if self.verbose > 0 and self.num_timesteps % (self.update_freq * 10) == 0:
-                        self.logger.record("cbf/trust_score", self.current_trust)
-                        self.logger.record("policy/entropy_coef", ent_coef if 'ent_coef' in locals() else 0.0)
-            
-            except Exception as e:
-                if self.verbose > 0:
-                    print(f"[TRUST] Error updating trust score: {e}")
-        
-        return True
-
-
-def create_cnn_env(
-    num_timesteps: int = 100000,
-    render: bool = False,
-    num_npc: int = 200,
-    num_pedestrians: int = 200,
-    port: int = 2000
-) -> gym.Env:
-    """Create full environment stack: CARLA → CNN → CBF → Occlusions (no STT)"""
-    
-    print("[ENV] Creating CARLA environment...")
-    
-    # Base CARLA environment with raw RGB observations
+def create_cnn_env(port: int = 2000, render: bool = False, num_npc: int = 200,
+                   num_pedestrians: int = 200, curriculum_stage: int = 0):
+    """CarlaGymEnv -> CBFSafetyLayerWrapper -> CnnNavObservationWrapper."""
+    print(f"[ENV] Connecting to CARLA on port {port} (curriculum stage {curriculum_stage})...")
     env = CarlaGymEnv(
-        host='localhost',
+        host="localhost",
         port=port,
         timeout=10.0,
-        time_limit=1000,
-        render_mode='human' if render else None,
+        time_limit=TIME_LIMIT,
+        render_mode="human" if render else None,   # spectator follows the ego car
         num_npc_vehicles=num_npc,
         num_pedestrians=num_pedestrians,
-        show_sensor_data=render
+        show_sensor_data=render,                    # camera window
+        curriculum_stage=curriculum_stage,
     )
-    
-    # Get map for waypoint logging
-    carla_map = env.world.get_map()
-    
-    print("[ENV] Adding location context logging...")
-    env = LocationContextWrapper(env, carla_map)
-    
-    print("[ENV] Adding CBF safety layer...")
-    env = CBFSafetyLayerWrapper(env, alpha=1.0)
-    
-    print("[ENV] Adding occlusion wrapper...")
-    env = OcclusionWrapper(env, occlusion_type='mixed')
-    
-    # NOTE: ImageObservationWrapper LAST - converts dict obs to (C,H,W) for CnnPolicy
-    print("[ENV] Adding image observation wrapper for CnnPolicy...")
-    env = ImageObservationWrapper(env)
-    
-    print("[OK] Environment fully initialized\n")
-    
+    env = CBFSafetyLayerWrapper(env)
+    env = CnnNavObservationWrapper(env, size=84, occlusion=OCCLUSION)
+    print("[ENV] CarlaGymEnv -> CBFSafetyLayerWrapper -> CnnNavObservationWrapper ready")
     return env
 
 
-def train_5q_cnn_sac(
-    timesteps: int = 100000,
-    port: int = 2000,
-    log_dir: str = "./logs/5q_cnn",
-    learning_rate: float = 3e-4,
-    batch_size: int = 64,
-    buffer_size: int = 50000,
-    render: bool = False,
-    num_npc: int = 100,
-    num_pedestrians: int = 30,
-    load_checkpoint: str = None
-):
-    """Train 5 Q-Network SAC with CNN (no STT)
-
-    If `load_checkpoint` is given, the SAC weights/optimizer/hyperparameters are
-    restored from that .zip and training CONTINUES (timestep counter and
-    TensorBoard curves are not reset). NOTE: the replay buffer is NOT stored in
-    the checkpoint, so it restarts empty and refills over the first
-    `learning_starts` steps — the learned networks are preserved, so this is a
-    true continuation, not a from-scratch run.
-    """
-    
-    os.makedirs(log_dir, exist_ok=True)
+def train(args) -> int:
+    log_dir = args.log_dir
     tb_dir = os.path.join(log_dir, "tensorboard")
     ckpt_dir = os.path.join(log_dir, "checkpoints")
     os.makedirs(tb_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
-    
+
+    resume = bool(args.load_checkpoint)
+    if resume:
+        if not os.path.isfile(args.load_checkpoint):
+            raise FileNotFoundError(f"--load-checkpoint not found: {args.load_checkpoint}")
+        done = checkpoint_num_timesteps(args.load_checkpoint)
+        if done is not None and done >= args.timesteps:
+            print(f"[RESUME] checkpoint is at {done:,} steps; target {args.timesteps:,} already reached. Nothing to do.")
+            return 0
+
+    start_stage = FINAL_STAGE if args.no_curriculum else args.start_stage
+    env_stage = resolve_start_stage(log_dir, start_stage, resume=resume)
+
     print("=" * 80)
-    print("5 Q-NETWORK SAC WITH CNN ONLY (NO SPATIOTEMPORAL TRANSFORMER)")
+    print(f"SAC {EXPERIMENT}: {POLICY}, {N_CRITICS} critics, image 84x84 + nav")
+    print(f"target {args.timesteps:,} steps | lr {args.lr} | batch {args.batch_size} | buffer {args.buffer_size:,}")
+    print(f"warm-up {args.warmup_steps:,} expert steps | curriculum {'off (final stage)' if args.no_curriculum else 'on'}"
+          f" | stage {env_stage} | NPC {args.num_npc} | pedestrians {args.num_pedestrians}")
+    print(f"render {args.render} | port {args.port} | log dir {log_dir}")
+    if resume:
+        print(f"resume from {args.load_checkpoint}")
     print("=" * 80)
-    print(f"Timesteps: {timesteps:,}")
-    print(f"Q-networks: 5 (higher uncertainty estimation)")
-    print(f"Perception: ResNet50 (pretrained) → CnnPolicy (no STT)")
-    print(f"Learning rate: {learning_rate}")
-    print(f"Batch size: {batch_size}")
-    print(f"Buffer size: {buffer_size:,}")
-    print(f"NPC vehicles: {num_npc}")
-    print(f"Pedestrians: {num_pedestrians}")
-    print(f"Render: {render}")
-    print(f"Log dir: {log_dir}")
-    print("=" * 80 + "\n")
-    
-    # Create environment
-    env = create_cnn_env(
-        num_timesteps=timesteps,
-        render=render,
-        num_npc=num_npc,
-        num_pedestrians=num_pedestrians,
-        port=port
-    )
-    
-    # Policy kwargs with 5 Q-networks (ensemble)
-    policy_kwargs = {
-        'net_arch': {
-            'pi': [256, 256],    # Actor network
-            'qf': [256, 256]     # Critic networks
-        },
-        'n_critics': 5,          # 5 Q-networks (ensemble) - better uncertainty
-        'normalize_images': True,
-    }
-    
-    if load_checkpoint:
-        # Resume: restore weights/optimizer/hyperparameters and continue.
-        if not os.path.isfile(load_checkpoint):
-            raise FileNotFoundError(f"--load-checkpoint not found: {load_checkpoint}")
-        print(f"Resuming SAC agent from checkpoint: {load_checkpoint}")
-        model = SAC.load(load_checkpoint, env=env, tensorboard_log=tb_dir)
-        # Try to restore a matching replay buffer if one was saved alongside the
-        # checkpoint (e.g. '<ckpt>_replay_buffer.pkl'); otherwise warn that the
-        # buffer starts empty.
-        import re
-        rb_candidates = [
-            load_checkpoint.replace(".zip", "_replay_buffer.pkl"),
-            re.sub(r"_(\d+)_steps\.zip$", r"_replay_buffer_\1_steps.pkl", load_checkpoint),
-        ]
-        rb_path = next((p for p in rb_candidates if os.path.isfile(p)), None)
-        if rb_path:
-            model.load_replay_buffer(rb_path)
-            print(f"[OK] Replay buffer restored from {rb_path} "
-                  f"({model.replay_buffer.size()} transitions)")
-        else:
-            print("[WARN] No saved replay buffer found for this checkpoint — the "
-                  "buffer starts EMPTY and refills over the first `learning_starts` "
-                  "steps. Network weights are preserved, so this is still a true "
-                  "continuation, not a from-scratch run.")
-        print("[OK] Agent resumed\n")
-    else:
-        print("Creating SAC agent with 5 Q-networks and CNN policy...")
-        model = SAC(
-            'CnnPolicy',             # CNN policy processes raw RGB directly
-            env,
-            learning_rate=learning_rate,
-            batch_size=batch_size,
-            buffer_size=buffer_size,
-            gamma=0.99,
-            tau=0.005,
-            train_freq=1,
-            gradient_steps=1,
-            ent_coef='auto',
-            policy_kwargs=policy_kwargs,
-            tensorboard_log=tb_dir,
-            verbose=1
-        )
-        print("[OK] Agent created\n")
-    
-    # Setup logger
-    logger = configure(tb_dir, ["stdout", "tensorboard"])
-    model.set_logger(logger)
-    
-    # Callbacks
-    # save_replay_buffer=True so future resumes can restore the buffer and avoid
-    # the empty-buffer warm-up. name_prefix unchanged for checkpoint compatibility.
-    checkpoint_callback = CheckpointCallback(
-        save_freq=10000,
-        save_path=ckpt_dir,
-        name_prefix="sac_5q_cnn",
-        save_replay_buffer=True
-    )
-    
-    safety_callback = SafetyMetricsCallback(verbose=1)
-    trust_callback = PolicyTrustScoreCallback(update_freq=100, verbose=1)
-    metrics_callback = ComprehensiveMetricsLoggingCallback(verbose=1)
-    
-    # Train
-    print(f"Training for {timesteps:,} timesteps...\n")
+
+    env = create_cnn_env(port=args.port, render=args.render, num_npc=args.num_npc,
+                         num_pedestrians=args.num_pedestrians, curriculum_stage=env_stage)
     try:
-        model.learn(
-            total_timesteps=timesteps,
-            log_interval=1,
-            callback=[checkpoint_callback, safety_callback, trust_callback, metrics_callback],
-            progress_bar=True,
-            # Resume → keep the existing timestep counter and TB curves (true
-            # continuation). Fresh run → start from 0.
-            reset_num_timesteps=not bool(load_checkpoint)
-        )
-    except KeyboardInterrupt:
-        print("\n[INTERRUPT] Training interrupted by user")
-    except Exception as e:
-        print(f"\n[ERROR] {e}")
-        import traceback
-        traceback.print_exc()
-    
-    # Save final model
-    final_path = os.path.join(log_dir, "sac_5q_cnn_final.zip")
-    model.save(final_path)
-    print(f"\n[OK] Final model saved: {final_path}")
-    
-    # Save experiment info
-    info_path = os.path.join(log_dir, "experiment_info.txt")
-    with open(info_path, "w") as f:
-        f.write("5 Q-Network SAC with CNN Only (No SpatioTemporal Transformer)\n")
-        f.write("=" * 60 + "\n\n")
-        f.write(f"Timesteps: {timesteps:,}\n")
-        f.write(f"Q-networks: 5 (ensemble for better uncertainty)\n")
-        f.write(f"Learning rate: {learning_rate}\n")
-        f.write(f"Batch size: {batch_size}\n")
-        f.write(f"Buffer size: {buffer_size:,}\n")
-        f.write(f"NPC vehicles: {num_npc}\n")
-        f.write(f"Pedestrians: {num_pedestrians}\n")
-        f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"\nArchitecture:\n")
-        f.write(f"- Perception: ResNet50 (pretrained ImageNet)\n")
-        f.write(f"- Encoder: NONE (raw RGB to CNN)\n")
-        f.write(f"- Policy: CnnPolicy (convolutional neural network)\n")
-        f.write(f"- Q-networks: 5 critics (256-256 each) - ensemble uncertainty\n")
-        f.write(f"\nFeatures:\n")
-        f.write(f"- CBF safety layer (dynamic constraints)\n")
-        f.write(f"- Random occlusions (30% episodes)\n")
-        f.write(f"- Waypoint logging (junctions, merges, lanes)\n")
-        f.write(f"- Reverse reward for collision recovery\n")
-        f.write(f"\nKey Differences:\n")
-        f.write(f"- 5 Q-networks instead of 2 (better uncertainty)\n")
-        f.write(f"- Direct RGB image input to CNN policy (no STT)\n")
-        f.write(f"- Faster inference than STT variants\n")
-    
-    print(f"[OK] Experiment info saved: {info_path}")
-    
-    # Cleanup
-    env.close()
-    print("[OK] Environment closed")
-    
-    print("\n" + "=" * 80)
-    print("TRAINING COMPLETE")
-    print("=" * 80)
-    print(f"View results: tensorboard --logdir {tb_dir}")
+        policy_kwargs = {
+            "net_arch": {"pi": [256, 256], "qf": [256, 256]},
+            "n_critics": N_CRITICS,
+            "normalize_images": True,
+        }
+        buffer_restored = False
+        if resume:
+            try:
+                model = SAC.load(args.load_checkpoint, env=env, tensorboard_log=tb_dir)
+            except ValueError as exc:
+                print(f"[ERROR] cannot resume from {args.load_checkpoint}: {exc}\n"
+                      "        Checkpoints from before the v3 env (3-D action, old observation) are "
+                      "incompatible; start a fresh run.")
+                return 1
+            buffer_restored = restore_replay_buffer(model, args.load_checkpoint)
+            print(f"[RESUME] model restored at {model.num_timesteps:,} steps")
+        else:
+            model = SAC(
+                POLICY,
+                env,
+                learning_rate=args.lr,
+                buffer_size=args.buffer_size,
+                learning_starts=LEARNING_STARTS,
+                batch_size=args.batch_size,
+                tau=0.005,
+                gamma=0.99,
+                train_freq=1,
+                gradient_steps=1,
+                ent_coef="auto",
+                policy_kwargs=policy_kwargs,
+                tensorboard_log=tb_dir,
+                verbose=1,
+            )
+
+        remaining = max(0, args.timesteps - model.num_timesteps)
+        if remaining == 0:
+            print(f"[RESUME] target {args.timesteps:,} steps already reached. Nothing to do.")
+            return 0
+
+        model.set_logger(configure(tb_dir, ["stdout", "tensorboard"]))
+
+        warmup_steps = 0 if buffer_restored else max(0, args.warmup_steps)
+        write_run_config(log_dir, model, extra={
+            "experiment": EXPERIMENT,
+            "policy": POLICY,
+            "n_critics": N_CRITICS,
+            "net_arch": policy_kwargs["net_arch"],
+            "observation": "image (3,84,84) uint8 + nav",
+            "occlusion": OCCLUSION,
+            "timesteps_target": args.timesteps,
+            "timesteps_at_start": int(model.num_timesteps),
+            "warmup_steps": warmup_steps,
+            "learning_starts": LEARNING_STARTS,
+            "time_limit": TIME_LIMIT,
+            "curriculum": {"enabled": not args.no_curriculum, "start_stage": start_stage, "env_stage": env_stage},
+            "num_npc": args.num_npc,
+            "num_pedestrians": args.num_pedestrians,
+            "port": args.port,
+            "render": args.render,
+            "resumed_from": args.load_checkpoint,
+            "replay_buffer_restored": buffer_restored,
+            "stack": describe_env_stack(model),
+        })
+
+        if warmup_steps > 0:
+            try:
+                prefill_replay_buffer(model, warmup_steps, log_every=1000)
+            except KeyboardInterrupt:
+                print("\n[INTERRUPT] stopped during the expert warm-up; nothing saved")
+                return 1
+
+        callbacks = [
+            CheckpointCallback(save_freq=SAVE_FREQ, save_path=ckpt_dir, name_prefix=NAME_PREFIX,
+                               save_replay_buffer=True),
+            EvalCallback(eval_freq=EVAL_FREQ, n_episodes=EVAL_EPISODES, log_dir=log_dir, verbose=1),
+            PolicyTrustScoreCallback(update_freq=100),
+            EpisodeMetricsCallback(log_dir=log_dir, verbose=1),
+            CurriculumCallback(log_dir, start_stage=start_stage, verbose=1),
+            LogEveryNTimesteps(n_steps=SB3_TABLE_EVERY),
+        ]
+
+        print(f"[TRAIN] {remaining:,} steps to go (from {model.num_timesteps:,} to {args.timesteps:,})")
+        status = 0
+        try:
+            # reset_num_timesteps=False: SB3 adds `remaining` to the current counter, and the episode
+            # left running by the warm-up continues (no extra reset).
+            model.learn(total_timesteps=remaining, callback=callbacks, log_interval=None,
+                        progress_bar=False, reset_num_timesteps=False)
+        except KeyboardInterrupt:
+            print(f"\n[INTERRUPT] training interrupted at {model.num_timesteps:,} steps")
+            save_checkpoint(model, ckpt_dir, NAME_PREFIX)
+            return 1
+        except Exception as exc:  # noqa: BLE001 - keep the run resumable, then report
+            print(f"\n[ERROR] {exc}")
+            traceback.print_exc()
+            try:
+                save_checkpoint(model, ckpt_dir, NAME_PREFIX)
+            except Exception as save_exc:  # noqa: BLE001
+                print(f"[ERROR] could not save a checkpoint after the failure: {save_exc}")
+            return 1
+
+        final_path = os.path.join(log_dir, f"{NAME_PREFIX}_final.zip")
+        model.save(final_path)
+        print(f"[OK] final model saved: {final_path}")
+        print(f"View curves: tensorboard --logdir {tb_dir}")
+        return status
+    finally:
+        env.close()
+        print("[OK] environment closed")
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="5 Q-network SAC, CNN (image + nav, MultiInputPolicy)")
+    parser.add_argument("--timesteps", type=int, default=1_000_000,
+                        help="TARGET TOTAL policy steps (on resume: trains target - checkpoint steps)")
+    parser.add_argument("--port", type=int, default=2000, help="CARLA server port")
+    parser.add_argument("--log-dir", type=str, default="./logs/5q_cnn", help="Run directory")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate (fresh runs; resume keeps the checkpoint's)")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument("--buffer-size", type=int, default=50000, help="Replay buffer size (fresh runs)")
+    parser.add_argument("--render", action="store_true", help="Camera window + spectator follows the car")
+    parser.add_argument("--num-npc", type=int, default=200, help="NPC vehicles in the full-traffic stage")
+    parser.add_argument("--num-pedestrians", type=int, default=200, help="Pedestrians in the full-traffic stage")
+    parser.add_argument("--warmup-steps", type=int, default=20000,
+                        help="Expert transitions put in the replay buffer before learning "
+                             "(skipped when a replay buffer is restored on resume)")
+    parser.add_argument("--start-stage", type=int, default=0, choices=range(FINAL_STAGE + 1),
+                        help="Curriculum stage to start from (a higher saved stage wins on resume)")
+    parser.add_argument("--no-curriculum", action="store_true",
+                        help=f"Train directly on the final stage ({FINAL_STAGE})")
+    parser.add_argument("--load-checkpoint", type=str, default=None,
+                        help="SAC .zip to resume from (replay buffer restored if saved beside it)")
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="5 Q-Network SAC with CNN Only"
-    )
-    parser.add_argument("--timesteps", type=int, default=100000, help="Total timesteps")
-    parser.add_argument("--port", type=int, default=2000, help="CARLA server port")
-    parser.add_argument("--log-dir", type=str, default="./logs/5q_cnn", help="Log directory")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
-    parser.add_argument("--buffer-size", type=int, default=50000, help="Replay buffer size")
-    parser.add_argument("--render", action="store_true", help="Enable rendering")
-    parser.add_argument("--num-npc", type=int, default=200, help="Number of NPC vehicles")
-    parser.add_argument("--num-pedestrians", type=int, default=200, help="Number of pedestrians")
-    parser.add_argument("--load-checkpoint", type=str, default=None,
-                        help="Path to a saved SAC .zip to resume training from "
-                             "(true continuation; replay buffer restored if a "
-                             "matching '*_replay_buffer.pkl' sits beside it).")
-
-    args = parser.parse_args()
-    
-    train_5q_cnn_sac(
-        timesteps=args.timesteps,
-        port=args.port,
-        log_dir=args.log_dir,
-        learning_rate=args.lr,
-        batch_size=args.batch_size,
-        buffer_size=args.buffer_size,
-        render=args.render,
-        num_npc=args.num_npc,
-        num_pedestrians=args.num_pedestrians,
-        load_checkpoint=args.load_checkpoint
-    )
+    sys.exit(train(parse_args()))
