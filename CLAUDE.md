@@ -21,7 +21,7 @@ CarlaUE4.exe -fps=20 --carla-port=2000      # Windows
 
 Four experiment scripts in `experiments/`, named `<N>q<Arch>sac_experiment.py` where `N` ∈ {2,5} is the critic-ensemble size and `Arch` ∈ {CNN, stt}:
 
-- `2qCNNsac_experiment.py`, `5qCNNsac_experiment.py` — 84×84 camera + 26-dim nav vector → `MultiInputPolicy`
+- `2qCNNsac_experiment.py`, `5qCNNsac_experiment.py` — 84×84 camera + 26-dim nav vector → `MultiInputPolicy`. The 5q script also takes `--cnn {nature,resnet50}` (default `nature` = SB3's NatureCNN) and `--resnet-train {head,layer4,all}` (default `layer4`): the complete ImageNet ResNet-50 (stem, layer1-4, avgpool, fc re-headed 2048→256) replaces NatureCNN with the same 256-d output, so the SAC decision layers are unchanged (`commons/resnet_extractor.py`). ResNet runs use their own log dir / checkpoint prefix (`5q_cnn_resnet_<mode>`; `train_all.py --only 5q_cnn_resnet_layer4`) and must start fresh
 - `2qsac_stt_experiment.py`, `5qsac_stt_experiment.py` — cached per-frame ResNet50 codes (8 frames) + nav vector → `MultiInputPolicy` with the trainable SpatioTemporal Transformer as its features extractor (`commons/stt.py`)
 
 ```bash
