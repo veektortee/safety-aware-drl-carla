@@ -187,6 +187,32 @@ def test_checkpoint_ring_geometry():
     assert np.allclose(uv[0], [320.0, 180.0]) and uv[1, 0] > 320 and uv[1, 1] < 180 and np.isnan(uv[2]).all()
 
 
+def test_checkpoint_rings_count_the_finish_gate():
+    from types import SimpleNamespace
+
+    from demo.checkpoint_rings import CheckpointRings
+
+    route = SimpleNamespace(length_m=100.0, point_at=lambda s: (s, 0.0), z_at=lambda s: 0.0, yaw_at=lambda s: 0.0)
+    env = SimpleNamespace(route=route, _snapshot={"s": 0.0}, display_overlay=None, rgb_camera=None)
+    rings = CheckpointRings(env, overview=False)
+    assert env.display_overlay == rings.overlay
+    rings.start_episode()
+    assert len(rings.gates) == 3 and rings.gates[-1]["finish"]
+    env._snapshot["s"] = 65.0
+    rings.update()
+    assert rings.collected == 2
+    env._snapshot["s"] = 98.0           # the env ends the episode a little before the finish gate
+    rings.update()
+    assert rings.collected == 2
+    rings.finish_episode("endpoint")
+    assert rings.collected == 3, "a finished route shows N/N, not N-1/N"
+    rings.start_episode()
+    env._snapshot["s"] = 40.0
+    rings.update()
+    rings.finish_episode("collision")
+    assert rings.collected == 1, "only a finished route collects the remaining gates"
+
+
 if __name__ == "__main__":
     import traceback
 
