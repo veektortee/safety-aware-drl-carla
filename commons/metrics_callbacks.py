@@ -834,7 +834,8 @@ class EvalCallback(BaseCallback):
         obs, last_done, error = None, False, None
         try:
             for i in range(self.n_episodes):
-                venv.set_options({"spawn_index": i, "route_seed": i})
+                # map_slot: with map rotation, each round covers every town in the same fixed order
+                venv.set_options({"spawn_index": i, "route_seed": i, "map_slot": i, "map_slots": self.n_episodes})
                 obs = venv.reset()
                 last_done, metrics, agent_return, n_steps = False, None, 0.0, 0
                 while n_steps < self.max_episode_steps:
@@ -856,8 +857,9 @@ class EvalCallback(BaseCallback):
                 rec["spawn_index"] = i
                 records.append(rec)
                 if self.verbose:
+                    town = str(rec.get("map") or "")
                     _emit(format_episode_line(
-                        rec, prefix=f"  eval {i + 1:>2d}/{self.n_episodes} | spawn {i:>3d}"))
+                        rec, prefix=f"  eval {i + 1:>2d}/{self.n_episodes} | {town:<12s} | spawn {i:>3d}"))
         except BaseException as exc:
             error = exc
         for w, flag in frozen:
@@ -878,7 +880,7 @@ class EvalCallback(BaseCallback):
                         "run_id": _RUN_ID, "run_start_step": self.run_start_step,
                         "deterministic": self.deterministic})
         summary["episodes"] = [
-            {k: r.get(k) for k in ("spawn_index", "end_reason", "return_total", "length_steps",
+            {k: r.get(k) for k in ("spawn_index", "map", "end_reason", "return_total", "length_steps",
                                    "distance_m", "route_completion_frac", "collisions_total",
                                    "illegal_lane_invasions", "speeding_frac", "cbf_intervention_frac",
                                    "min_ttc_s", "curriculum_stage")}

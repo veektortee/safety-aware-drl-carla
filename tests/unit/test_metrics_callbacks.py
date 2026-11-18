@@ -276,10 +276,10 @@ def test_eval_callback_restores_state_and_is_not_counted():
             drive(callbacks, model, 1, steps_per_episode=3)      # crosses step 10 -> eval at rollout end
         mc.close_writers()
         assert evaluator.is_evaluating is False
-        # fixed spawns: options {spawn_index: i, route_seed: i}; DummyVecEnv auto-resets after each done
-        assert venv.resets == [{"spawn_index": 0, "route_seed": 0}, "auto",
-                               {"spawn_index": 1, "route_seed": 1}, "auto",
-                               {"spawn_index": 2, "route_seed": 2}, "auto"], venv.resets
+        # fixed spawns: options {spawn_index: i, route_seed: i} plus the eval map slot (i of n);
+        # DummyVecEnv auto-resets after each done
+        opts = lambda i: {"spawn_index": i, "route_seed": i, "map_slot": i, "map_slots": 3}  # noqa: E731
+        assert venv.resets == [opts(0), "auto", opts(1), "auto", opts(2), "auto"], venv.resets
         # training continues from the fresh auto-reset episode (no extra reset)
         assert np.array_equal(model._last_obs, np.full((1, 3), 6.0, dtype=np.float32))
         assert model._last_original_obs is model._last_obs
@@ -292,7 +292,7 @@ def test_eval_callback_restores_state_and_is_not_counted():
         # eval episodes never reach episodes.jsonl (only the 4 training episodes)
         assert len(mc.read_jsonl(episodes.jsonl_path)) == 4
         text = out.getvalue()
-        assert "══ EVAL @ 10 steps" in text and "eval  1/3 | spawn   0" in text
+        assert "══ EVAL @ 10 steps" in text and "eval  1/3 |" in text and "| spawn   0" in text
         assert all(train_all.parse_step(ln) is None for ln in text.splitlines() if "eval" in ln.lower())
         tags = tb_tags(mc.tb_dir(tmp))
         assert {f"eval/{f}" for f in ("success_frac", "crash_frac", "return_total_mean")} <= set(tags)
@@ -434,8 +434,9 @@ def test_real_sac_learn_with_eval_and_metrics():
         mc.close_writers()
         evals = mc.read_jsonl(os.path.join(tmp, "eval.jsonl"))
         assert [e["step"] for e in evals] == [50, 100], [e["step"] for e in evals]
-        assert {"spawn_index": 0, "route_seed": 0} in env.reset_options
-        assert {"spawn_index": 1, "route_seed": 1} in env.reset_options
+        slots = evaluator.n_episodes
+        assert {"spawn_index": 0, "route_seed": 0, "map_slot": 0, "map_slots": slots} in env.reset_options
+        assert {"spawn_index": 1, "route_seed": 1, "map_slot": 1, "map_slots": slots} in env.reset_options
         assert model.num_timesteps == 120
         recs = mc.read_jsonl(os.path.join(tmp, "episodes.jsonl"))
         # every training step is accounted for by complete or abandoned training episodes; eval episodes

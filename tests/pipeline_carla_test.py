@@ -232,6 +232,47 @@ def select_spawn_index(spawn_xyz, vehicle_xyz, walker_xyz, crash_xyz, order: Seq
     return best, False
 
 
+def map_basename(path: str) -> str:
+    """'/Game/Carla/Maps/Town03_Opt' or 'Carla/Maps/Town03_Opt' -> 'Town03_Opt'."""
+    return str(path).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+
+
+def pick_town_maps(available: Sequence[str]) -> List[str]:
+    """One map per installed town (Town01, Town02, ..., Town10HD), preferring the layered '_Opt' build.
+
+    `available` is client.get_available_maps(); test/empty maps (EmptyMap, OpenDriveMap) are skipped.
+    """
+    towns: Dict[str, str] = {}
+    for path in available:
+        name = map_basename(path)
+        if not name.startswith("Town"):
+            continue
+        town = name[:-4] if name.endswith("_Opt") else name
+        if town not in towns or name.endswith("_Opt"):
+            towns[town] = name
+    return [towns[t] for t in sorted(towns)]
+
+
+def next_map(maps: Sequence[str], current: str) -> str:
+    """The map after `current` in the rotation (the first one if `current` is not in it)."""
+    names = [map_basename(m) for m in maps]
+    cur = map_basename(current)
+    return names[(names.index(cur) + 1) % len(names)] if cur in names else names[0]
+
+
+def eval_map(maps: Sequence[str], slot: int, slots: int) -> str:
+    """Map of evaluation episode `slot` of `slots`: contiguous blocks covering every map once per round."""
+    slots = max(int(slots), 1)
+    i = min(int(slot) * len(maps) // slots, len(maps) - 1)
+    return map_basename(maps[i])
+
+
+def vehicle_cap(n_spawn_points: int) -> int:
+    """NPC vehicles a map can hold: its spawn points minus a reserve (>= 10, 10%) so the ego always
+    finds a clear spawn point."""
+    return max(0, int(n_spawn_points) - max(10, int(n_spawn_points) // 10))
+
+
 def condition_flags(snap: dict, cfg=RewardConfigV3) -> Tuple[bool, bool, bool]:
     """(off_route, wrong_way, blocked) conditions of one snapshot (the env counts consecutive steps)."""
     off_route = (not snap["on_drivable"]) or (abs(snap["e_y"]) > cfg.OFF_ROUTE_EY_M and not snap["in_same_dir_lane"])
@@ -395,6 +436,7 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
     TM_PORT_OFFSET = 6000   # Traffic Manager port = CARLA port + 6000 (2000 -> 8000), so parallel runs don't collide
     CAMERA_W = 640
     CAMERA_H = 360
+    MAP_LOAD_TIMEOUT_S = 180.0
 
     def __init__(
         self,
@@ -403,12 +445,19 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
         timeout: float = 10.0,
         time_limit: int = 3000,
         render_mode: Optional[str] = None,
-        num_npc_vehicles: int = 100,
-        num_pedestrians: int = 30,
+        num_npc_vehicles: int = 300,
+        num_pedestrians: int = 300,
         show_sensor_data: bool = False,
         curriculum_stage: int = 0,
         seed: Optional[int] = None,
+        maps="all",
+        map_rotate_every: int = 10,
     ):
+        """maps: 'all' = every installed town (one map per town, '_Opt' preferred), None = stay on the
+        server's current map, or a list of map names. Training switches to the next map every
+        `map_rotate_every` episodes; evaluation episodes pick their map with reset options
+        {'map_slot': i, 'map_slots': n} (or {'map': name}). num_npc_vehicles / num_pedestrians cap
+        the curriculum stage's counts."""
         self.host = host
         self.port = port
         self.timeout = timeout
@@ -417,6 +466,11 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
         self.num_npc_vehicles = int(num_npc_vehicles)
         self.num_pedestrians = int(num_pedestrians)
         self.show_sensor_data = bool(show_sensor_data)
+        self.display_overlay = None     # optional fn(BGR copy) -> BGR image for the camera window (demo HUD)
+        self._maps_request = maps
+        self.map_rotate_every = max(1, int(map_rotate_every))
+        self._maps: List[str] = []
+        self._episodes_on_map = 0
         self.curriculum_stage = int(np.clip(int(curriculum_stage), 0, len(STAGES) - 1))
         self._active_stage = self.curriculum_stage      # stage of the episode in progress
         self._seed = seed
@@ -482,17 +536,12 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
         })
 
         self._connect_carla()
+        self._maps = self._resolve_maps(maps)
+        if len(self._maps) > 1:
+            print(f"[ENV] Map rotation: {', '.join(self._maps)} (every {self.map_rotate_every} episodes)")
         self._setup_world()
-        self._clear_map()
-        self._spawn_points = list(self.map.get_spawn_points())
-        self._spawn_xyz = np.array([[sp.location.x, sp.location.y, sp.location.z] for sp in self._spawn_points])
-        self._spawn_ego()
-        self._attach_sensors()
-
-        self._grp = GlobalRoutePlanner(self.map, self.ROUTE_SAMPLING_M)
-        self._tl_tracker = TrafficLightTracker(self.world, self.map)
+        self._init_world_objects()
         self._red_monitor = RedLightMonitor()
-        self._stop_monitor = StopSignMonitor(self.world, self.map)
         self._expert = ExpertDriver()
 
         self._apply_stage_population()
@@ -501,6 +550,116 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
         self._tick()
 
     # ------------------------------------------------------------------ setup
+    def _resolve_maps(self, maps) -> List[str]:
+        if maps is None:
+            return [self.current_map_name]
+        if isinstance(maps, str) and maps.lower() == "all":
+            listing = getattr(self.client, "get_available_maps", None)
+            found = pick_town_maps(listing()) if callable(listing) else []
+            return found or [self.current_map_name]
+        names = [map_basename(m) for m in ([maps] if isinstance(maps, str) else maps)]
+        return names or [self.current_map_name]
+
+    @property
+    def current_map_name(self) -> str:
+        return map_basename(getattr(self.map, "name", "")) if self.map is not None else ""
+
+    def _init_world_objects(self):
+        """Ego, sensors, spawn points and the map-specific planners for the loaded world."""
+        self._clear_map()
+        self._spawn_points = list(self.map.get_spawn_points())
+        self._spawn_xyz = np.array([[sp.location.x, sp.location.y, sp.location.z] for sp in self._spawn_points])
+        self._spawn_ego()
+        self._attach_sensors()
+        self._grp = GlobalRoutePlanner(self.map, self.ROUTE_SAMPLING_M)
+        self._tl_tracker = TrafficLightTracker(self.world, self.map)
+        self._stop_monitor = StopSignMonitor(self.world, self.map)
+
+    def _release_world_actors(self):
+        """Stop and destroy the sensors, the traffic and the ego (before a map change or on close)."""
+        for sensor in (self.rgb_camera, self.lidar_sensor, self.collision_sensor, self.lane_invasion_sensor):
+            try:
+                if sensor is not None:
+                    sensor.stop()
+                    sensor.destroy()
+            except Exception:
+                pass
+        self.rgb_camera = self.lidar_sensor = self.collision_sensor = self.lane_invasion_sensor = None
+        try:
+            self._destroy_population()
+        except Exception:
+            self.npc_vehicles, self.walkers, self.walker_controllers = [], [], []
+            self._population_counts = None
+        try:
+            if self.ego_vehicle is not None:
+                self.ego_vehicle.destroy()
+        except Exception:
+            pass
+        self.ego_vehicle = None
+
+    def _load_map(self, name: str):
+        """Switch the server to another town and rebuild everything that belongs to the old one."""
+        name = map_basename(name)
+        t0 = time.time()
+        print(f"[ENV] Loading map {name} (was {self.current_map_name})...")
+        self._release_world_actors()
+        # Load in asynchronous mode and wait until the server really reports the new town: in
+        # synchronous mode load_world() can return the old world before the change took effect.
+        try:
+            settings = self.world.get_settings()
+            settings.synchronous_mode = False
+            settings.fixed_delta_seconds = None
+            self.world.apply_settings(settings)
+            self.traffic_manager.set_synchronous_mode(False)
+        except Exception:
+            pass
+        self.client.set_timeout(self.MAP_LOAD_TIMEOUT_S)
+        try:
+            world = self.client.load_world(name)
+            deadline = time.time() + self.MAP_LOAD_TIMEOUT_S
+            while map_basename(world.get_map().name) != name:
+                if time.time() > deadline:
+                    raise RuntimeError(f"CARLA did not switch to map {name} within {self.MAP_LOAD_TIMEOUT_S:.0f} s")
+                time.sleep(0.5)
+                world = self.client.get_world()
+        finally:
+            self.client.set_timeout(self.timeout)
+        self.world = world
+        self.map = self.world.get_map()
+        self.blueprint_library = self.world.get_blueprint_library()
+        self.spectator = self.world.get_spectator()
+        self._setup_world()
+        self.world.tick()
+        for q in (self._q_rgb, self._q_lidar, self._q_collision, self._q_lane):   # frames of the old world
+            while True:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+        self._init_world_objects()
+        self._population_counts = None
+        self._last_crash_xyz = None
+        self._proj_hint = None
+        self._episodes_on_map = 0
+        self._tick()
+        self._tick()
+        print(f"[ENV] Map {self.current_map_name} ready in {time.time() - t0:.0f} s "
+              f"({len(self._spawn_points)} spawn points)")
+
+    def _target_map(self, options: Dict) -> Optional[str]:
+        """The map this reset must switch to, or None to stay."""
+        if options.get("map"):
+            want = map_basename(options["map"])
+        elif len(self._maps) < 2:
+            return None
+        elif options.get("map_slot") is not None:
+            want = eval_map(self._maps, options["map_slot"], options.get("map_slots", 1))
+        elif self._episodes_on_map >= self.map_rotate_every:
+            want = next_map(self._maps, self.current_map_name)
+        else:
+            return None
+        return None if want == self.current_map_name else want
+
     def _connect_carla(self):
         print(f"Connecting to CARLA at {self.host}:{self.port}...")
         self.client = carla.Client(self.host, self.port)
@@ -646,10 +805,12 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
 
     # ---------------------------------------------------------- population
     def _population_target(self, stage: int) -> Tuple[int, int]:
+        """Stage counts, capped by the constructor's maxima and (vehicles) by the map's spawn points."""
         cfg = STAGES[stage]
-        n_npc = self.num_npc_vehicles if cfg.get("num_npc") is None else int(cfg["num_npc"])
-        n_walk = self.num_pedestrians if cfg.get("num_walkers") is None else int(cfg["num_walkers"])
-        return n_npc, n_walk
+        n_npc = self.num_npc_vehicles if cfg.get("num_npc") is None else min(int(cfg["num_npc"]), self.num_npc_vehicles)
+        n_walk = (self.num_pedestrians if cfg.get("num_walkers") is None
+                  else min(int(cfg["num_walkers"]), self.num_pedestrians))
+        return min(n_npc, vehicle_cap(len(self._spawn_points))), n_walk
 
     def _apply_stage_population(self):
         """(Re)spawn NPC vehicles and walkers when the active stage needs different counts."""
@@ -660,8 +821,9 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
         self._spawn_npcs(target[0])
         self._spawn_walkers(target[1])
         self._population_counts = target
-        print(f"[ENV] Traffic for stage {self._active_stage} ({STAGES[self._active_stage]['name']}): "
-              f"{len(self.npc_vehicles)}/{target[0]} vehicles, {len(self.walkers)}/{target[1]} walkers")
+        print(f"[ENV] Traffic for stage {self._active_stage} ({STAGES[self._active_stage]['name']}) on "
+              f"{self.current_map_name}: {len(self.npc_vehicles)}/{target[0]} vehicles, "
+              f"{len(self.walkers)}/{target[1]} walkers")
 
     def _spawn_npcs(self, n: int):
         if n <= 0:
@@ -793,12 +955,19 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
         """Start a new episode.
 
         options: 'spawn_index' (int, deterministic spawn point) and 'route_seed' (int, deterministic
-        destination) for evaluation. A pending curriculum stage change is applied here.
+        destination) for evaluation; 'map_slot' / 'map_slots' (evaluation map) or 'map' (a map name).
+        A pending curriculum stage change and a due map switch are applied here.
         """
         super().reset(seed=seed)
         if seed is not None:
             self._rng.seed(seed)
         options = dict(options or {})
+
+        target = self._target_map(options)
+        if target is not None:
+            self._load_map(target)
+        if options.get("map_slot") is None:
+            self._episodes_on_map += 1          # training episodes drive the rotation; eval ones do not
 
         self._active_stage = self.curriculum_stage
         stage = STAGES[self._active_stage]
@@ -838,6 +1007,7 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
 
         info = {
             "spawn_index": self._spawn_index,
+            "map": self.current_map_name,
             "route_length_m": float(self.route.length_m),
             "episode_limit": self._episode_limit,
             "curriculum_stage": self._active_stage,
@@ -1093,6 +1263,7 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
             "curriculum_stage": int(self._active_stage),
             "reward_components": {k: float(v) for k, v in ep["comps"].items()},
             "spawn_index": self._spawn_index,
+            "map": self.current_map_name,
             # SB3 Monitor-compatible keys (its _dump_logs reads 'r' and 'l')
             "r": ret,
             "l": int(self._episode_step),
@@ -1121,30 +1292,16 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
 
     def _show_camera(self):
         if self.show_sensor_data and self.rgb_data is not None:
-            cv2.imshow('CARLA RGB Camera', self.rgb_data)    # BGR, as cv2 expects
+            image = self.rgb_data
+            if self.display_overlay is not None:     # display only: the observation is never touched
+                image = self.display_overlay(self.rgb_data.copy())
+            cv2.imshow('CARLA RGB Camera', image)    # BGR, as cv2 expects
             cv2.waitKey(1)
 
     def close(self):
         """Destroy sensors and actors and hand the server back in asynchronous mode."""
         print("Destroying CARLA actors and sensors...")
-        for sensor in (self.rgb_camera, self.lidar_sensor, self.collision_sensor, self.lane_invasion_sensor):
-            try:
-                if sensor is not None:
-                    sensor.stop()
-                    sensor.destroy()
-            except Exception:
-                pass
-        self.rgb_camera = self.lidar_sensor = self.collision_sensor = self.lane_invasion_sensor = None
-        try:
-            self._destroy_population()
-        except Exception:
-            pass
-        try:
-            if self.ego_vehicle is not None:
-                self.ego_vehicle.destroy()
-        except Exception:
-            pass
-        self.ego_vehicle = None
+        self._release_world_actors()
         try:
             settings = self.world.get_settings()
             settings.synchronous_mode = False

@@ -36,7 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from stable_baselines3 import SAC
-from stable_baselines3.common.callbacks import CheckpointCallback, LogEveryNTimesteps
+from stable_baselines3.common.callbacks import LogEveryNTimesteps
 from stable_baselines3.common.logger import configure
 
 from tests.pipeline_carla_test import CarlaGymEnv, CBFSafetyLayerWrapper, PolicyTrustScoreCallback
@@ -49,6 +49,10 @@ from commons.warmup import (
     checkpoint_num_timesteps,
     describe_env_stack,
     prefill_replay_buffer,
+    LatestCheckpointCallback,
+    discard_logs_after,
+    mark_tensorboard_resume,
+    restore_curriculum_snapshot,
     restore_replay_buffer,
     save_checkpoint,
 )
@@ -104,9 +108,14 @@ def train(args) -> int:
         if done is not None and done >= args.timesteps:
             print(f"[RESUME] checkpoint is at {done:,} steps; target {args.timesteps:,} already reached. Nothing to do.")
             return 0
+        if done is not None:
+            # The run continues from the checkpoint: anything an earlier process logged after it
+            # (TensorBoard, episodes/eval jsonl, curriculum state) is erased or restored.
+            restore_curriculum_snapshot(log_dir, args.load_checkpoint)
+            discard_logs_after(log_dir, done)
 
     start_stage = FINAL_STAGE if args.no_curriculum else args.start_stage
-    env_stage = resolve_start_stage(log_dir, start_stage, resume=resume)
+    env_stage = resolve_start_stage(log_dir, start_stage, resume=resume, step=(done or 0) if resume else 0)
 
     print("=" * 80)
     print(f"SAC {EXPERIMENT}: {POLICY}, {N_CRITICS} critics, trainable STT (D={EMBED_DIM}) on "
@@ -166,6 +175,8 @@ def train(args) -> int:
             return 0
 
         model.set_logger(configure(tb_dir, ["stdout", "tensorboard"]))
+        if resume:
+            mark_tensorboard_resume(model.logger, model.num_timesteps)
 
         warmup_steps = 0 if buffer_restored else max(0, args.warmup_steps)
         write_run_config(log_dir, model, extra={
@@ -202,8 +213,7 @@ def train(args) -> int:
                 return 1
 
         callbacks = [
-            CheckpointCallback(save_freq=SAVE_FREQ, save_path=ckpt_dir, name_prefix=NAME_PREFIX,
-                               save_replay_buffer=True),
+            LatestCheckpointCallback(SAVE_FREQ, ckpt_dir, NAME_PREFIX, log_dir=log_dir, keep=1),
             EvalCallback(eval_freq=EVAL_FREQ, n_episodes=EVAL_EPISODES, log_dir=log_dir, verbose=1),
             PolicyTrustScoreCallback(update_freq=100),
             EpisodeMetricsCallback(log_dir=log_dir, verbose=1),
@@ -250,8 +260,10 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
     parser.add_argument("--buffer-size", type=int, default=50000, help="Replay buffer size (fresh runs)")
     parser.add_argument("--render", action="store_true", help="Camera window + spectator follows the car")
-    parser.add_argument("--num-npc", type=int, default=200, help="NPC vehicles in the full-traffic stage")
-    parser.add_argument("--num-pedestrians", type=int, default=200, help="Pedestrians in the full-traffic stage")
+    parser.add_argument("--num-npc", type=int, default=300,
+                        help="Maximum NPC vehicles (caps the curriculum; also capped by each map's spawn points)")
+    parser.add_argument("--num-pedestrians", type=int, default=300,
+                        help="Maximum pedestrians (caps the curriculum's counts)")
     parser.add_argument("--warmup-steps", type=int, default=20000,
                         help="Expert transitions put in the replay buffer before learning "
                              "(skipped when a replay buffer is restored on resume)")

@@ -685,12 +685,18 @@ def test_offline_env_curriculum_stage_change():
     env.set_curriculum_stage(2)
     assert env._active_stage == 0                        # applies at the next reset
     _, info = env.reset()
-    assert calls == [("npc", 15), ("walker", 15)] and info["curriculum_stage"] == 2
-    env.set_curriculum_stage(3)
-    env.reset()
-    assert calls[-2:] == [("npc", 40), ("walker", 20)]   # None -> constructor counts
-    env.reset()
-    assert len(calls) == 4                               # unchanged counts: no respawn
+    # the fake map has 6 spawn points: no room for NPC cars (spawn-point reserve), walkers as staged
+    assert calls == [("npc", 0), ("walker", 15)] and info["curriculum_stage"] == 2
+    original_cap = env_mod.vehicle_cap
+    env_mod.vehicle_cap = lambda n: 1000                 # a big map
+    try:
+        env.set_curriculum_stage(3)
+        env.reset()
+        assert calls[-2:] == [("npc", 40), ("walker", 20)]   # stage 60/60 capped by the constructor's 40/20
+        env.reset()
+        assert len(calls) == 4                               # unchanged counts: no respawn
+    finally:
+        env_mod.vehicle_cap = original_cap
     env.world.scheduled[env.world.frame + 1] = [("_q_collision", ("walker.pedestrian.0001", 9, 50.0))]
     _, r, term, _, info = env.step(np.array([0.0, 0.0], np.float32))
     assert term and info["terminated_reason"] == "collision_pedestrian"

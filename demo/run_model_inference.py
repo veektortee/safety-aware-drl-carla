@@ -9,7 +9,10 @@ wrapper stack as training:
     CarlaGymEnv -> CBFSafetyLayerWrapper -> SttNavObservationWrapper   (STT models: frame codes + nav)
 
 The variant is detected from the model's observation space. The camera window is shown and the
-spectator follows the car (disable with --no-render). One line is printed per episode.
+spectator follows the car (disable with --no-render). One line is printed per episode. Each episode
+runs in the next installed town (--maps current stays on the loaded one), and game-style checkpoint
+rings mark the route in both views (demo/checkpoint_rings.py; --no-rings hides them). The rings are
+display-only: the policy's camera input is unchanged.
 
 With the CBF enabled, the critic-ensemble trust score is computed from the loaded model at every
 step and fed to the safety layer, as PolicyTrustScoreCallback does during training (--no-trust
@@ -100,6 +103,8 @@ def build_env(model, args, model_path: str):
         num_pedestrians=args.num_pedestrians,
         show_sensor_data=not args.no_render,
         curriculum_stage=args.stage,
+        maps=None if args.maps == "current" else "all",
+        map_rotate_every=1,          # every episode in the next town
     )
     if not args.no_cbf:
         env = CBFSafetyLayerWrapper(env, use_trust_score=not args.no_trust)
@@ -117,8 +122,22 @@ def build_env(model, args, model_path: str):
     return env, variant
 
 
-def run_episode(model, env, cbf_wrapper, use_trust: bool, reset_options: Optional[dict]) -> dict:
+def find_carla_env(env) -> Optional[CarlaGymEnv]:
+    while env is not None:
+        if isinstance(env, CarlaGymEnv):
+            return env
+        env = getattr(env, "env", None)
+    return None
+
+
+def run_episode(model, env, cbf_wrapper, use_trust: bool, reset_options: Optional[dict], rings=None) -> dict:
     obs, info = env.reset(options=reset_options)
+    if rings is not None:
+        rings.start_episode()
+    gates = f", {len(rings.gates)} checkpoints" if rings is not None else ""
+    print(f"[DEMO] driving on {info.get('map', '?')}: route {info.get('route_length_m', 0.0):.0f} m{gates} "
+          f"(runs to the finish, a crash or the time limit; the next episode starts only after)", flush=True)
+    # No step cap here on purpose: every episode runs until the env itself ends it.
     done = False
     ep_return, steps, trust_values = 0.0, 0, []
     while not done:
@@ -129,6 +148,8 @@ def run_episode(model, env, cbf_wrapper, use_trust: bool, reset_options: Optiona
                 cbf_wrapper.set_trust_score(trust)
                 trust_values.append(trust)
         obs, reward, terminated, truncated, info = env.step(action)
+        if rings is not None:
+            rings.update()
         ep_return += float(reward)
         steps += 1
         done = bool(terminated or truncated)
@@ -138,7 +159,11 @@ def run_episode(model, env, cbf_wrapper, use_trust: bool, reset_options: Optiona
         metrics = {}
     end_reason = (metrics.get("end_reason") or info.get("terminated_reason")
                   or info.get("truncated_reason") or "unknown")
+    if rings is not None:
+        rings.finish_episode(end_reason)
     return {
+        "map": metrics.get("map", ""),
+        "checkpoints": f"{rings.collected}/{len(rings.gates)}" if rings is not None else None,
         "end_reason": end_reason,
         "route_completion_frac": float(metrics.get("route_completion_frac", info.get("route_completion_frac", 0.0))),
         "collisions": int(metrics.get("collisions", 0)),
@@ -157,7 +182,8 @@ def run_episode(model, env, cbf_wrapper, use_trust: bool, reset_options: Optiona
 def format_line(i: int, n: int, r: dict) -> str:
     trust = f" | trust {r['trust_mean']:.2f}" if r["trust_mean"] is not None else ""
     ped = f" (pedestrian {r['collisions_pedestrian']})" if r["collisions_pedestrian"] else ""
-    return (f"ep {i}/{n} | END {r['end_reason']:<20s} | route {r['route_completion_frac']:4.0%} | "
+    cps = f" | checkpoints {r['checkpoints']}" if r.get("checkpoints") else ""
+    return (f"ep {i}/{n} | {r.get('map', ''):<12s} | END {r['end_reason']:<16s} | route {r['route_completion_frac']:4.0%}{cps} | "
             f"collisions {r['collisions']}{ped} | R {r['return']:+8.1f} | {r['length_steps']} steps "
             f"{r['distance_m'] / 1000:.2f} km | {r['mean_speed_mps']:.1f} m/s | cbf {r['cbf_intervention_frac']:.0%}{trust}")
 
@@ -184,6 +210,9 @@ def main(argv=None) -> int:
     parser.add_argument("--no-cbf", action="store_true", help="Run without the CBF safety layer")
     parser.add_argument("--no-trust", action="store_true", help="CBF with a fixed trust of 1.0")
     parser.add_argument("--no-render", action="store_true", help="No camera window / spectator follow")
+    parser.add_argument("--maps", choices=["all", "current"], default="all",
+                        help="all: every installed town, one per episode (default); current: stay on the loaded map")
+    parser.add_argument("--no-rings", action="store_true", help="Hide the checkpoint rings and HUD")
     parser.add_argument("--cpu", action="store_true", help="Run the policy on the CPU")
     parser.add_argument("--list-models", action="store_true", help="List legacy models in --checkpoint-dir")
     parser.add_argument("--quiet", action="store_true", help="Only print the per-episode lines and the summary")
@@ -208,6 +237,11 @@ def main(argv=None) -> int:
     model = SAC.load(model_path, device=device)
     env, variant = build_env(model, args, model_path)
     cbf_wrapper = find_cbf_wrapper(env)
+    rings = None
+    if not (args.no_rings or args.no_render):
+        from demo.checkpoint_rings import CheckpointRings
+
+        rings = CheckpointRings(find_carla_env(env))
     if not args.quiet:
         print("=" * 100)
         print(f"model {Path(model_path).name} | {variant} | critics {model.critic.n_critics} | "
@@ -221,7 +255,8 @@ def main(argv=None) -> int:
         for i in range(args.episodes):
             options = {"spawn_index": i, "route_seed": i} if args.fixed_spawns else None
             t0 = time.time()
-            r = run_episode(model, env, cbf_wrapper, use_trust=not args.no_trust, reset_options=options)
+            r = run_episode(model, env, cbf_wrapper, use_trust=not args.no_trust, reset_options=options,
+                            rings=rings)
             r["episode"] = i + 1
             r["wall_s"] = round(time.time() - t0, 1)
             results.append(r)

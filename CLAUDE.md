@@ -40,6 +40,8 @@ Outputs go to `<log-dir>/{tensorboard,checkpoints}`, `episodes.jsonl`, `eval.jso
 
 - **`--timesteps` is the target total**, not an increment — resuming a 440k checkpoint with `--timesteps 1000000` trains ~560k more.
 - **The replay buffer is NOT in the `.zip`.** Runs save `*_replay_buffer_<N>_steps.pkl` beside the checkpoint and the resume code auto-loads it (both file-name patterns are tried).
+- **Only the latest checkpoint is kept** (`LatestCheckpointCallback`, every 25k total steps: zip + replay buffer + `*_curriculum_<N>_steps.json`, written atomically, older ones deleted afterwards).
+- **A resume erases everything logged after the checkpoint**: TensorBoard events (rewritten in place, works while TensorBoard is running), `episodes.jsonl` / `eval.jsonl` records, and the curriculum state is restored from the checkpoint's snapshot (`discard_logs_after`, `restore_curriculum_snapshot`, `mark_tensorboard_resume` in `commons/warmup.py`). TensorBoard continues the same run from the checkpoint step.
 - Checkpoints from before reward v3 (3-D action, image-only observation) are **incompatible** with the current env.
 - `--lr` / `--buffer-size` are read from the checkpoint on resume, not the CLI.
 - **The checkpoint's reward function must match the code's current reward**, or the critic's Q-values are miscalibrated against the new rewards (instability, not a clean continuation).
@@ -60,6 +62,12 @@ CarlaGymEnv              (tests/pipeline_carla_test.py)  — obs {rgb_data, nav}
 
 Supporting modules: `commons/route.py` + `commons/navigation/` (CARLA GlobalRoutePlanner routes, route projection), `commons/perception.py` (lead gap from the actor list + ground-filtered LiDAR along the curved route corridor), `commons/traffic_rules.py` (red lights, stop signs, lane-change legality), `commons/expert.py` (autopilot used for the replay-buffer warm-up), `commons/vehicle_model.py` (measured CARLA dynamics), `commons/curriculum_stages.py`, `commons/metrics_callbacks.py`.
 
+**Maps**: `CarlaGymEnv(maps="all")` (the default) rotates through every installed town, one map per town with the `_Opt` build preferred (`client.get_available_maps()`; here Town01-05 and Town10HD — `D:\WORK\Carla\HDMaps` only holds point clouds). Training switches to the next town every `map_rotate_every=10` episodes; each eval round spreads its 10 fixed episodes over all towns (reset options `map_slot`/`map_slots`). `_load_map` drops to asynchronous mode for the load and waits until the server reports the new town (in synchronous mode `load_world` can return the old world). Episode records carry `map`.
+
+**Curriculum** (`commons/curriculum_stages.py`): 6 stages — S0 empty short routes, S1 empty full routes, S2 15 cars/15 pedestrians, S3 60/60, S4 150/150, S5 300/300 (cars capped by each map's spawn points minus a 10% reserve; `--num-npc` / `--num-pedestrians` are maxima, default 300). Promotion at >= 80% success over 50 episodes, and at the latest at total steps 15k/35k/65k/100k/140k, so the whole curriculum fits in 200k steps; a resumed run starts at least at the stage the schedule allows for its step count.
+
+**Demo** (`demo/run_model_inference.py`): one episode per town, each run to its natural end (no step cap), with game-style checkpoint rings every 30 m (`demo/checkpoint_rings.py`): HUD ovals in the server window (`draw_hud_line`, not seen by camera sensors) and projected rings + HUD in the camera window via `CarlaGymEnv.display_overlay` (display only, the observation is untouched).
+
 SB3 then auto-wraps this in a `DummyVecEnv`, which breaks `.unwrapped`. Use the helpers `_unwrap_vec_env(model)` and `_find_carla_and_cbf(model)` (in `pipeline_carla_test.py`) to reach the real `CarlaGymEnv` / `CBFSafetyLayerWrapper` — they traverse `.envs[0]` then the `.env` chain. Callbacks rely on these.
 
 **The trust-score control loop** is the non-obvious heart of the system and spans three files:
@@ -73,7 +81,7 @@ SB3 then auto-wraps this in a `DummyVecEnv`, which breaks `.unwrapped`. Use the 
 
 ## Reward function — read this before changing it
 
-Reward v3 (`compute_reward_v3` in `tests/pipeline_carla_test.py`, constants in `RewardConfigV3`): `+1·clip(Δs_route/(v_limit·dt), −1, 1)` progress along the planned route, `−0.2`/step time cost, small speeding/lateral/heading penalties (capped at −0.5/step), −1 per illegal lane crossing, −10 per stop-sign violation; terminal +50 at the route end, crash −C (C = 50/100/150/300 by curriculum stage, ×2 for pedestrians, scaled by speed), and −C for red-light runs, off-route (1 s) and wrong-way (2 s). Timeout and "blocked without a reason" (15 s stopped with no lead obstacle/red light) are **truncations** (bootstrapped, no penalty). Two invariants to keep when changing it:
+Reward v3 (`compute_reward_v3` in `tests/pipeline_carla_test.py`, constants in `RewardConfigV3`): `+1·clip(Δs_route/(v_limit·dt), −1, 1)` progress along the planned route, `−0.2`/step time cost, small speeding/lateral/heading penalties (capped at −0.5/step), −1 per illegal lane crossing, −10 per stop-sign violation; terminal +50 at the route end, crash −C (C = 50/100/150/200/250/300 by curriculum stage, ×2 for pedestrians, scaled by speed), and −C for red-light runs, off-route (1 s) and wrong-way (2 s). Timeout and "blocked without a reason" (15 s stopped with no lead obstacle/red light) are **truncations** (bootstrapped, no penalty). Two invariants to keep when changing it:
 
 - **No alive bonus.** Progress is a finite supply, so finishing sooner always scores higher; a positive per-step reward makes the agent avoid every termination including the goal, a negative one with a cheap exit makes it seek exits (both happened in earlier versions: 95% crashes, then 93–97% parking).
 - **A crash must cost more than any non-crash outcome**, but not so much early on that parking beats learning to drive — hence the stage-scaled C.

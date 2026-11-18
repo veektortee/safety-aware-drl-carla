@@ -3,11 +3,14 @@
 An episode counts as a success when it reached the end of its route
 (info['episode_metrics']['end_reason'] == 'endpoint'). The callback promotes stage k -> k+1 once the
 current stage has run at least MIN_EPISODES_PER_STAGE episodes and at least PROMOTE_SUCCESS_RATE of
-the last PROMOTE_WINDOW of them were successes. A new stage takes effect at the env's next reset;
-episodes that were still running under the previous stage are not counted for the new one.
+the last PROMOTE_WINDOW of them were successes, and at the latest when the run reaches
+PROMOTE_BY_STEP[k] total steps (the step schedule that fits the curriculum into 200k steps). A new
+stage takes effect at the env's next reset; episodes that were still running under the previous
+stage are not counted for the new one.
 
 State is persisted to <log_dir>/curriculum_state.json after every episode and restored when training
-resumes (model.num_timesteps > 0), so a restart never drops back to an easier stage.
+resumes (model.num_timesteps > 0), so a restart never drops back to an easier stage; a resumed run
+also starts at least at the stage the schedule allows for its step count.
 """
 
 import json
@@ -22,9 +25,11 @@ from stable_baselines3.common.callbacks import BaseCallback
 from commons.curriculum_stages import (
     FINAL_STAGE,
     MIN_EPISODES_PER_STAGE,
+    PROMOTE_BY_STEP,
     PROMOTE_SUCCESS_RATE,
     PROMOTE_WINDOW,
     STAGES,
+    scheduled_stage,
 )
 
 STATE_FILE = "curriculum_state.json"
@@ -50,13 +55,15 @@ def load_curriculum_state(log_dir: str) -> Optional[dict]:
         return None
 
 
-def resolve_start_stage(log_dir: str, start_stage: int = 0, resume: bool = False) -> int:
-    """Stage to construct the env with: max(start_stage, saved stage) when resuming, else start_stage."""
+def resolve_start_stage(log_dir: str, start_stage: int = 0, resume: bool = False, step: int = 0) -> int:
+    """Stage to construct the env with. Fresh run: start_stage. Resume (at total step `step`): the
+    highest of start_stage, the saved stage and the stage the step schedule allows."""
     stage = _clip_stage(start_stage)
     if resume:
         saved = load_curriculum_state(log_dir)
         if saved is not None:
             stage = max(stage, _clip_stage(saved["stage"]))
+        stage = max(stage, scheduled_stage(step))
     return stage
 
 
@@ -101,6 +108,13 @@ class CurriculumCallback(BaseCallback):
                 self.history = list(saved.get("history", []))
                 self.total_episodes = int(saved.get("total_episodes", 0))
                 self.history.append({"event": "set", "stage": self.stage, "step": int(self.model.num_timesteps)})
+        due = scheduled_stage(self.model.num_timesteps)
+        if resumed and self.stage < due:     # resumed past the schedule marks of the saved stage
+            self.history.append({"event": "schedule", "from": self.stage, "to": due,
+                                 "step": int(self.model.num_timesteps)})
+            self.stage = due
+            self.window.clear()
+            self.episodes_in_stage = 0
 
         from commons.warmup import find_carla_env
         self.carla_env = find_carla_env(self.model)
@@ -110,7 +124,8 @@ class CurriculumCallback(BaseCallback):
         if self.verbose:
             if self.stage < FINAL_STAGE:
                 rule = (f"promote at >= {PROMOTE_SUCCESS_RATE:.0%} success over the last {PROMOTE_WINDOW} "
-                        f"episodes (min {MIN_EPISODES_PER_STAGE} per stage)")
+                        f"episodes (min {MIN_EPISODES_PER_STAGE} per stage), at the latest at step "
+                        f"{PROMOTE_BY_STEP[self.stage]:,}")
             else:
                 rule = "final stage"
             print(f"[CURRICULUM] stage {self.stage}/{FINAL_STAGE} {stage_name(self.stage)}"
@@ -139,20 +154,26 @@ class CurriculumCallback(BaseCallback):
     def success_rate(self) -> float:
         return float(np.mean(self.window)) if len(self.window) else 0.0
 
-    def _should_promote(self) -> bool:
+    def _gate_met(self) -> bool:
         return (
-            self.stage < FINAL_STAGE
-            and self.episodes_in_stage >= MIN_EPISODES_PER_STAGE
+            self.episodes_in_stage >= MIN_EPISODES_PER_STAGE
             and len(self.window) >= PROMOTE_WINDOW
             and self.success_rate() >= PROMOTE_SUCCESS_RATE
         )
 
+    def _schedule_due(self) -> bool:
+        return self.stage < FINAL_STAGE and self.num_timesteps >= PROMOTE_BY_STEP[self.stage]
+
+    def _should_promote(self) -> bool:
+        return self.stage < FINAL_STAGE and (self._gate_met() or self._schedule_due())
+
     def _promote(self) -> None:
         old, rate, n_eps = self.stage, self.success_rate(), self.episodes_in_stage
+        reason = "success" if self._gate_met() else "schedule"
         self.stage = old + 1
         self.history.append({
             "event": "promote", "from": old, "to": self.stage, "step": int(self.num_timesteps),
-            "success_rate": round(rate, 3), "episodes_in_stage": n_eps,
+            "reason": reason, "success_rate": round(rate, 3), "episodes_in_stage": n_eps,
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
         })
         self.window.clear()
@@ -160,9 +181,10 @@ class CurriculumCallback(BaseCallback):
         self._apply_stage()
         self._save()
         if self.verbose:
+            why = (f"success {rate:.0%} over the last {PROMOTE_WINDOW} episodes" if reason == "success"
+                   else f"step schedule (mark {PROMOTE_BY_STEP[old]:,}; success {rate:.0%})")
             print(f"[CURRICULUM] step {self.num_timesteps:,}: promoted {stage_name(old)} -> "
-                  f"{stage_name(self.stage)} (success {rate:.0%} over the last {PROMOTE_WINDOW} episodes, "
-                  f"{n_eps} episodes in stage)")
+                  f"{stage_name(self.stage)} ({why}, {n_eps} episodes in stage)")
 
     def _apply_stage(self) -> None:
         env = self.carla_env
@@ -183,7 +205,7 @@ class CurriculumCallback(BaseCallback):
             "total_episodes": self.total_episodes,
             "num_timesteps": int(self.num_timesteps),
             "thresholds": {"success_rate": PROMOTE_SUCCESS_RATE, "window": PROMOTE_WINDOW,
-                           "min_episodes": MIN_EPISODES_PER_STAGE},
+                           "min_episodes": MIN_EPISODES_PER_STAGE, "promote_by_step": PROMOTE_BY_STEP},
             "history": self.history,
             "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
