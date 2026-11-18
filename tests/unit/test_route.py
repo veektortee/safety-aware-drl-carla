@@ -255,6 +255,13 @@ def test_plan_length_window_and_fallbacks():
     r = Route.plan(Broken(), wmap, start, [], 80.0, 150.0, random.Random(0))
     assert r.length_m > 0.0
 
+    class Degenerate:   # the trace "succeeds" but is 2 m long (seen on Town04): a free goal if accepted
+        def trace_route(self, a, b):
+            return [(w, RoadOption.LANEFOLLOW) for w in polyline_waypoints([(a.x, a.y), (a.x + 2.0, a.y)])]
+
+    r = Route.plan(Degenerate(), wmap, start, spawns, 80.0, 150.0, random.Random(0))
+    assert 80.0 <= r.length_m <= 150.0, r.length_m      # lane-follow instead of the 2 m trace
+
 
 def test_bundled_planner_on_real_map():
     """GlobalRoutePlanner + Route on an offline OpenDRIVE map (skipped if the .xodr is absent)."""

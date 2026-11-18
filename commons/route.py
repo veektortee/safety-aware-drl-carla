@@ -235,12 +235,20 @@ class Route:
         """Route from `start` to a random spawn point; first one with length in [min, max] wins.
 
         Routes with GRP lane-change glitches (a kink > MAX_KINK_DEG between consecutive segments)
-        are not accepted. Falls back to the traced route closest to the range (glitch-free ones
-        first), then to a plain lane-follow route from the start (random branch at junctions).
-        Never returns an empty route.
+        are not accepted. Destinations are drawn from the spawn points whose straight-line distance
+        can give a route in range (all of them if none can). Falls back to the traced route closest
+        to the range (glitch-free ones first) if it is at least half the minimum length, else to a
+        plain lane-follow route from the start (random branch at junctions). Never returns an empty
+        or degenerate route (on big maps a failed trace once gave a 2 m "route" = a free goal).
         """
         start_loc = _as_location(start)
         cands = list(spawn_points or [])
+        in_reach = []
+        for p in cands:
+            loc = _as_location(p)
+            if 0.5 * min_len_m <= math.hypot(loc.x - start_loc.x, loc.y - start_loc.y) <= max_len_m:
+                in_reach.append(p)
+        cands = in_reach or cands
         best, best_err = None, float("inf")
         for _ in range(max_tries):
             if not cands:
@@ -265,7 +273,7 @@ class Route:
             err = max(0.0, min_len_m - length, length - max_len_m) + (0.0 if clean else 1e4)
             if err < best_err:
                 best, best_err = route, err
-        if best is not None:
+        if best is not None and best.length_m >= 0.5 * min_len_m:
             return best
         return cls._lane_follow_route(wmap, start_loc, min_len_m, max_len_m, rng)
 

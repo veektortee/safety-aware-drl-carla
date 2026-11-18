@@ -198,10 +198,12 @@ def main(argv=None) -> int:
     parser.add_argument("--checkpoint-dir", type=str, default="demos", help="Folder for --model / --list-models")
     parser.add_argument("--episodes", type=int, default=3, help="Number of episodes")
     parser.add_argument("--port", type=int, default=2000, help="CARLA server port")
-    parser.add_argument("--num-npc", type=int, default=50, help="NPC vehicles (final stage)")
-    parser.add_argument("--num-pedestrians", type=int, default=15, help="Pedestrians (final stage)")
+    parser.add_argument("--num-npc", type=int, default=300,
+                        help="Maximum NPC vehicles (default 300; capped by the stage and by each map's spawn points)")
+    parser.add_argument("--num-pedestrians", type=int, default=300, help="Maximum pedestrians (default 300)")
     parser.add_argument("--stage", type=int, default=FINAL_STAGE, choices=range(FINAL_STAGE + 1),
-                        help=f"Curriculum stage of the scenario (default {FINAL_STAGE}: full traffic)")
+                        help=f"Curriculum stage of the scenario (default {FINAL_STAGE}: dense traffic, up to "
+                             f"300 cars / 300 pedestrians)")
     parser.add_argument("--fixed-spawns", action="store_true",
                         help="Episode i uses spawn_index=i, route_seed=i (repeatable, like evaluation)")
     parser.add_argument("--occlusion", type=str, default="none",
