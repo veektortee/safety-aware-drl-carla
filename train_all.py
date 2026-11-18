@@ -29,6 +29,7 @@ Usage - run from the CARLA-RL-Agents folder with the venv active:
     python ..\\train_all.py                       # all four, one after another
     python ..\\train_all.py --parallel 2          # two at a time, ports 2000/2010
     python ..\\train_all.py --no-render           # faster, nothing drawn
+    python ..\\train_all.py --only 5q_cnn_resnet_layer4   # opt-in: 5q CNN with a ResNet-50 image branch
 
 A CARLA server must already be listening on each port in use, unless you pass
 --carla-exe, in which case the runner starts and restarts CARLA itself:
@@ -64,6 +65,14 @@ EXPERIMENTS = {
     "2q_stt": {"script": "2qsac_stt_experiment.py", "log_dir": "logs/2q_stt", "prefix": "sac_2q_stt"},
     "5q_stt": {"script": "5qsac_stt_experiment.py", "log_dir": "logs/5q_stt", "prefix": "sac_5q_stt"},
 }
+# 5q CNN with the ImageNet ResNet-50 image branch, one entry per --resnet-train mode. Opt-in: run only
+# when named with --only (the default run stays the four experiments above).
+for _mode in ("head", "layer4", "all"):
+    EXPERIMENTS[f"5q_cnn_resnet_{_mode}"] = {
+        "script": "5qCNNsac_experiment.py", "log_dir": f"logs/5q_cnn_resnet_{_mode}",
+        "prefix": f"sac_5q_cnn_resnet_{_mode}", "args": ["--cnn", "resnet50", "--resnet-train", _mode],
+        "opt_in": True,
+    }
 
 # Per-episode line from commons/metrics_callbacks.py: "ep  412 | step    98,340 | ..."
 EPISODE_STEP_RE = re.compile(r"^\s*ep\s+\d+\s*\|\s*step\s+([\d,]+)\s*\|")
@@ -288,9 +297,9 @@ def exp_log_dir(name, cfg, args):
     return (args.cwd / cfg["log_dir"]).resolve()
 
 
-def build_command(script, port, log_dir, checkpoint, args):
+def build_command(script, port, log_dir, checkpoint, args, extra_args=()):
     """Experiment command line. --timesteps is the TARGET total; the script subtracts
-    the restored step counter itself when resuming."""
+    the restored step counter itself when resuming. extra_args: the experiment's own options."""
     cmd = [
         sys.executable,
         str(script),
@@ -298,7 +307,7 @@ def build_command(script, port, log_dir, checkpoint, args):
         "--port", str(port),
         "--log-dir", str(log_dir),
         "--buffer-size", str(args.buffer_size),
-    ]
+    ] + list(extra_args)
     if args.render:
         cmd.append("--render")
     if args.num_npc is not None:
@@ -367,7 +376,7 @@ def run_experiment(name, cfg, args, port):
                     continue
                 log(f"[{name}] CARLA found on port {port}")
 
-            cmd = build_command(script, port, log_dir, checkpoint, args)
+            cmd = build_command(script, port, log_dir, checkpoint, args, cfg.get("args", ()))
 
             if checkpoint is None:
                 log(f"[{name}] starting fresh, target {args.timesteps:,} steps, port {port}")
@@ -481,7 +490,7 @@ def main(argv=None):
         args.port_step = 0 if args.parallel == 1 else 10
     args.echo = (not args.quiet) and args.parallel == 1
 
-    names = args.only or list(EXPERIMENTS)
+    names = args.only or [n for n, cfg in EXPERIMENTS.items() if not cfg.get("opt_in")]
 
     # skip_experiments.txt (project root, one name per line) drops experiments
     # without editing the launcher. Logged as "DONE - skipped" so the watchdog
