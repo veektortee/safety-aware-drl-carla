@@ -46,6 +46,15 @@ make_report.py.
 
 Stop everything with Ctrl+C. Progress is kept in the checkpoints, so starting
 the runner again simply picks up where it left off.
+
+Memory guard (Windows): on 2026-11-18 an experiment process committed 75 GB in a
+few minutes and froze the PC. Every experiment now runs in a Job Object that
+caps its committed memory (--mem-hard-gb, enforced by the OS), and a watchdog
+kills it earlier (--mem-limit-gb) so it is restarted from the latest checkpoint.
+The runner also puts itself in a kill-on-close job: if it dies (window closed,
+Ctrl+C, crash), the CARLA server and the experiment it started die with it.
+Runner messages, exit codes and memory readings go to <log-root>/train_all.log
+and to each experiment's runner.log.
 """
 
 import argparse
@@ -99,9 +108,18 @@ def parse_step(line):
     return None
 
 
+RUNNER_LOG = None   # Path of train_all.log (set in main); runner messages are kept there too
+
+
 def log(msg):
     with PRINT_LOCK:
         print(f"[runner {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+        if RUNNER_LOG is not None:
+            try:
+                with open(RUNNER_LOG, "a", encoding="utf-8", errors="replace") as handle:
+                    handle.write(f"[runner {time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+            except OSError:
+                pass
 
 
 def human(seconds):
@@ -178,6 +196,247 @@ def kill_process_tree(proc):
             pass
 
 
+# --------------------------------------------------------------------------- memory guard
+# Layer 1, Job Objects (OS-enforced): the experiment process gets a hard cap on its committed memory,
+# so a runaway fails inside the experiment instead of exhausting the page file. The runner's own
+# kill-on-close job makes every child (CARLA, the experiment) die with the runner.
+# Layer 2, MemoryGuard thread: polls the experiment's private bytes every second, logs them, and kills
+# the process tree at the soft limit, below the hard cap, so the restart is clean and logged.
+GB = 1024 ** 3
+_JOB_EXTENDED_LIMIT_INFO = 9                    # JobObjectExtendedLimitInformation
+_JOB_LIMIT_PROCESS_MEMORY = 0x0100
+_JOB_LIMIT_DIE_ON_UNHANDLED_EXCEPTION = 0x0400  # no "has stopped working" dialog holding a dead process
+_JOB_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+_JOB_BASIC_PROCESS_ID_LIST = 3                  # JobObjectBasicProcessIdList
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+# venv\Scripts\python.exe is a launcher whose CHILD is the real interpreter. The experiment is created
+# suspended, put in its job, then resumed, so that child is born inside the job (no race).
+CREATE_SUSPENDED = 0x00000004
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes as _wt
+
+    class _MEMORY_COUNTERS(ctypes.Structure):          # PROCESS_MEMORY_COUNTERS_EX
+        _fields_ = [("cb", _wt.DWORD), ("PageFaultCount", _wt.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+                    ("PrivateUsage", ctypes.c_size_t)]
+
+    class _BASIC_LIMITS(ctypes.Structure):             # JOBOBJECT_BASIC_LIMIT_INFORMATION
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", _wt.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", _wt.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", _wt.DWORD), ("SchedulingClass", _wt.DWORD)]
+
+    class _IO_COUNTERS(ctypes.Structure):
+        _fields_ = [(f, ctypes.c_uint64) for f in ("ReadOperationCount", "WriteOperationCount",
+                                                   "OtherOperationCount", "ReadTransferCount",
+                                                   "WriteTransferCount", "OtherTransferCount")]
+
+    class _EXTENDED_LIMITS(ctypes.Structure):          # JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        _fields_ = [("BasicLimitInformation", _BASIC_LIMITS), ("IoInfo", _IO_COUNTERS),
+                    ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    class _PID_LIST(ctypes.Structure):                 # JOBOBJECT_BASIC_PROCESS_ID_LIST (room for 64)
+        _fields_ = [("NumberOfAssignedProcesses", _wt.DWORD), ("NumberOfProcessIdsInList", _wt.DWORD),
+                    ("ProcessIdList", ctypes.c_size_t * 64)]
+
+    _K32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _NTDLL = ctypes.WinDLL("ntdll")
+    _NTDLL.NtResumeProcess.argtypes = [_wt.HANDLE]
+    _NTDLL.NtResumeProcess.restype = ctypes.c_long
+    _K32.OpenProcess.argtypes = [_wt.DWORD, _wt.BOOL, _wt.DWORD]
+    _K32.OpenProcess.restype = _wt.HANDLE
+    _K32.TerminateJobObject.argtypes = [_wt.HANDLE, ctypes.c_uint]
+    _K32.TerminateJobObject.restype = _wt.BOOL
+    _K32.CreateJobObjectW.argtypes = [ctypes.c_void_p, _wt.LPCWSTR]
+    _K32.CreateJobObjectW.restype = _wt.HANDLE
+    _K32.SetInformationJobObject.argtypes = [_wt.HANDLE, ctypes.c_int, ctypes.c_void_p, _wt.DWORD]
+    _K32.SetInformationJobObject.restype = _wt.BOOL
+    _K32.QueryInformationJobObject.argtypes = [_wt.HANDLE, ctypes.c_int, ctypes.c_void_p, _wt.DWORD,
+                                               ctypes.c_void_p]
+    _K32.QueryInformationJobObject.restype = _wt.BOOL
+    _K32.AssignProcessToJobObject.argtypes = [_wt.HANDLE, _wt.HANDLE]
+    _K32.AssignProcessToJobObject.restype = _wt.BOOL
+    _K32.GetCurrentProcess.restype = _wt.HANDLE
+    _K32.CloseHandle.argtypes = [_wt.HANDLE]
+    _K32.CloseHandle.restype = _wt.BOOL
+    _K32.K32GetProcessMemoryInfo.argtypes = [_wt.HANDLE, ctypes.c_void_p, _wt.DWORD]
+    _K32.K32GetProcessMemoryInfo.restype = _wt.BOOL
+
+
+class Job:
+    """A Windows Job Object: processes in it are killed when its last handle closes (runner exit),
+    crash dialogs are suppressed, and optionally each process's committed memory is capped."""
+
+    def __init__(self, process_handle, hard_limit_gb: float = 0.0):
+        self.handle = None
+        if os.name != "nt":
+            return
+        job = _K32.CreateJobObjectW(None, None)
+        if not job:
+            raise OSError(ctypes.get_last_error(), "CreateJobObject failed")
+        info = _EXTENDED_LIMITS()
+        flags = _JOB_LIMIT_KILL_ON_JOB_CLOSE | _JOB_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
+        if hard_limit_gb > 0:
+            flags |= _JOB_LIMIT_PROCESS_MEMORY
+            info.ProcessMemoryLimit = int(hard_limit_gb * GB)
+        info.BasicLimitInformation.LimitFlags = flags
+        ok = _K32.SetInformationJobObject(job, _JOB_EXTENDED_LIMIT_INFO, ctypes.byref(info), ctypes.sizeof(info))
+        ok = ok and _K32.AssignProcessToJobObject(job, process_handle)
+        if not ok:
+            err = ctypes.get_last_error()
+            _K32.CloseHandle(job)
+            raise OSError(err, "could not set up the job object")
+        self.handle = job
+
+    @classmethod
+    def for_popen(cls, proc, hard_limit_gb: float = 0.0):
+        return cls(int(proc._handle), hard_limit_gb) if os.name == "nt" else cls(None)
+
+    def peak_gb(self) -> float:
+        """Highest committed memory of any process in the job so far."""
+        if not self.handle:
+            return 0.0
+        info = _EXTENDED_LIMITS()
+        if _K32.QueryInformationJobObject(self.handle, _JOB_EXTENDED_LIMIT_INFO, ctypes.byref(info),
+                                          ctypes.sizeof(info), None):
+            return info.PeakProcessMemoryUsed / GB
+        return 0.0
+
+    def process_ids(self):
+        if not self.handle:
+            return []
+        info = _PID_LIST()
+        if not _K32.QueryInformationJobObject(self.handle, _JOB_BASIC_PROCESS_ID_LIST, ctypes.byref(info),
+                                              ctypes.sizeof(info), None):
+            return []
+        return [int(info.ProcessIdList[i]) for i in range(min(info.NumberOfProcessIdsInList, 64))]
+
+    def max_private_gb(self) -> float:
+        """Largest committed private memory of any process now in the job (the cap is per process)."""
+        best = 0.0
+        for pid in self.process_ids():
+            handle = _K32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if handle:
+                try:
+                    best = max(best, _private_gb_of(handle) or 0.0)
+                finally:
+                    _K32.CloseHandle(handle)
+        return best
+
+    def terminate(self, exit_code: int = 1) -> bool:
+        """Kill every process in the job (the launcher and the interpreter it started)."""
+        return bool(self.handle) and bool(_K32.TerminateJobObject(self.handle, exit_code))
+
+    def close(self):
+        """Closing the last handle kills whatever is still running in the job."""
+        if self.handle:
+            _K32.CloseHandle(self.handle)
+            self.handle = None
+
+
+def _private_gb_of(handle):
+    counters = _MEMORY_COUNTERS()
+    counters.cb = ctypes.sizeof(_MEMORY_COUNTERS)
+    if _K32.K32GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+        return counters.PrivateUsage / GB
+    return None
+
+
+def resume_process(proc):
+    """Resume a child created with CREATE_SUSPENDED."""
+    if os.name == "nt" and proc is not None:
+        status = _NTDLL.NtResumeProcess(int(proc._handle))
+        if status != 0:
+            raise OSError(status, f"NtResumeProcess failed (NTSTATUS 0x{status & 0xFFFFFFFF:08X})")
+
+
+def experiment_private_gb(proc, job):
+    """Committed private memory of the experiment in GB - the largest process of its job, since the
+    venv launcher's child is the real interpreter - or None once it has exited."""
+    if os.name != "nt" or proc is None or proc.poll() is not None:
+        return None
+    if job is not None and job.handle:
+        return job.max_private_gb()
+    return _private_gb_of(int(proc._handle))
+
+
+class MemoryGuard(threading.Thread):
+    """Polls the experiment's private memory 4 times a second. Writes a reading every `log_every_s` and
+    kills the process tree above `limit_gb` (the runner then restarts it from the latest checkpoint).
+    It also kills an experiment that printed nothing for `stall_s` seconds: a native CARLA hang inside
+    world.tick() (seen before a crash on 2026-11-19) neither exits nor grows."""
+
+    def __init__(self, proc, job, name, limit_gb, log_every_s, write, stall_s=0.0):
+        super().__init__(daemon=True, name=f"memguard-{name}")
+        self.proc, self.job, self.name = proc, job, name
+        self.limit_gb, self.log_every_s, self.write = limit_gb, log_every_s, write
+        self.stall_s = float(stall_s)
+        self.last_output = time.time()     # updated by stream_run for every line the experiment prints
+        self.peak_gb = 0.0
+        self.tripped_gb = None
+        self.stalled_s = None
+        self._halt = threading.Event()
+
+    def _kill(self, msg):
+        self.write(msg)
+        log(msg)
+        if not (self.job is not None and self.job.terminate(1)):
+            kill_process_tree(self.proc)
+
+    def run(self):
+        last_report = time.time()
+        while not self._halt.wait(0.25):   # a runaway reached ~2 GB/s; poll fast
+            if self.proc.poll() is not None:
+                return
+            silent = time.time() - self.last_output
+            if self.stall_s > 0 and silent > self.stall_s:
+                self.stalled_s = silent
+                self._kill(f"[STALL] {self.name}: no output for {silent / 60:.1f} min (limit "
+                           f"{self.stall_s / 60:g} min) - killing it; it restarts from the latest checkpoint")
+                return
+            if os.name != "nt":
+                continue
+            gb = experiment_private_gb(self.proc, self.job)
+            if gb is None:
+                return
+            self.peak_gb = max(self.peak_gb, gb)
+            if self.limit_gb > 0 and gb > self.limit_gb:
+                self.tripped_gb = gb
+                self._kill(f"[MEMGUARD] {self.name}: experiment uses {gb:.1f} GB private memory (limit "
+                           f"{self.limit_gb:g} GB) - killing it; it restarts from the latest checkpoint")
+                return
+            if self.log_every_s > 0 and time.time() - last_report >= self.log_every_s:
+                last_report = time.time()
+                self.write(f"[MEM] {self.name}: private {gb:.2f} GB (peak {self.peak_gb:.2f} GB)")
+
+    def stop(self):
+        self._halt.set()
+
+
+_EXIT_CODES = {
+    0xC000013A: "console closed or Ctrl+C",
+    0xC0000005: "access violation (native crash)",
+    0xC0000017: "out of memory",
+    0xC0000409: "fail-fast / buffer overrun (native crash)",
+    0xC00000FD: "stack overflow",
+    0xC0000374: "heap corruption",
+}
+
+
+def describe_exit(code):
+    if code is None:
+        return "unknown"
+    unsigned = int(code) & 0xFFFFFFFF
+    text = _EXIT_CODES.get(unsigned, "")
+    return f"{code} (0x{unsigned:08X}{', ' + text if text else ''})"
+
+
 def port_is_open(port, host="localhost", timeout=2.0):
     """True once something (the CARLA server) accepts connections on this port."""
     try:
@@ -240,13 +499,21 @@ def report_progress(name, samples, target):
     log(f"[{name}] {s1:,} / {target:,} steps | {rate:.1f} steps/s | ETA {human(eta)}")
 
 
-def stream_run(cmd, cwd, env, log_file, name, echo, samples, target, eta_every):
-    """Run the training script, mirror its output, and track progress."""
+def stream_run(cmd, cwd, env, log_file, name, echo, samples, target, eta_every,
+               mem_limit_gb=0.0, mem_hard_gb=0.0, mem_log_every=300.0, stall_minutes=0.0):
+    """Run the training script under the memory guard, mirror its output, and track progress.
+
+    Returns (returncode, highest_step, saw_error, memory_kill_gb or None, stalled_seconds or None)."""
     last_report = time.time()
     highest_step = 0
     saw_error = False
+    write_lock = threading.Lock()
 
     with open(log_file, "a", encoding="utf-8", errors="replace", buffering=1) as handle:
+        def write(line):
+            with write_lock:
+                handle.write(f"[runner {time.strftime('%H:%M:%S')}] {line}\n")
+
         handle.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} :: {' '.join(cmd)} =====\n")
         proc = subprocess.Popen(
             cmd,
@@ -258,10 +525,27 @@ def stream_run(cmd, cwd, env, log_file, name, echo, samples, target, eta_every):
             bufsize=1,
             encoding="utf-8",
             errors="replace",
+            creationflags=CREATE_SUSPENDED if os.name == "nt" else 0,
         )
+        job = None
+        try:
+            job = Job.for_popen(proc, mem_hard_gb)
+            if mem_hard_gb > 0 and os.name == "nt":
+                write(f"memory guard: hard cap {mem_hard_gb:g} GB (OS job limit), "
+                      f"watchdog kill at {mem_limit_gb:g} GB")
+        except OSError as exc:   # never run unguarded silently
+            job = None
+            write(f"WARNING could not attach the memory job object: {exc}")
+            log(f"[{name}] WARNING could not attach the memory job object: {exc}")
+        finally:
+            resume_process(proc)   # only now may the launcher start the interpreter (inside the job)
+        guard = MemoryGuard(proc, job, name, mem_limit_gb, mem_log_every, write, stall_s=60.0 * stall_minutes)
+        guard.start()
         try:
             for line in proc.stdout:
-                handle.write(line)
+                guard.last_output = time.time()
+                with write_lock:
+                    handle.write(line)
                 if echo:
                     with PRINT_LOCK:
                         sys.stdout.write(line)
@@ -287,8 +571,21 @@ def stream_run(cmd, cwd, env, log_file, name, echo, samples, target, eta_every):
             except Exception:
                 pass
             returncode = proc.wait()
+            guard.stop()
+            peak = max(job.peak_gb() if job else 0.0, guard.peak_gb)
+            if job:
+                job.close()
+            summary = f"experiment exited: code {describe_exit(returncode)}, peak memory {peak:.2f} GB"
+            if guard.stalled_s is not None:
+                summary += f" - killed by the stall watchdog after {guard.stalled_s / 60:.1f} min without output"
+            elif guard.tripped_gb is not None:
+                summary += f" - killed by the memory guard at {guard.tripped_gb:.1f} GB"
+            elif mem_hard_gb > 0 and peak >= 0.98 * mem_hard_gb:
+                summary += f" - hit the {mem_hard_gb:g} GB hard cap"
+            write(summary)
+            log(f"[{name}] {summary}")
 
-    return returncode, highest_step, saw_error
+    return returncode, highest_step, saw_error, guard.tripped_gb, guard.stalled_s
 
 
 def exp_log_dir(name, cfg, args):
@@ -385,10 +682,12 @@ def run_experiment(name, cfg, args, port):
                     f"{remaining:,} to go, port {port}")
 
             started = time.time()
-            returncode, highest_step, saw_error = stream_run(
+            returncode, highest_step, saw_error, mem_kill_gb, stalled_s = stream_run(
                 cmd, args.cwd, env, runner_log, name,
                 echo=args.echo, samples=samples,
                 target=args.timesteps, eta_every=args.eta_every,
+                mem_limit_gb=args.mem_limit_gb, mem_hard_gb=args.mem_hard_gb,
+                mem_log_every=args.mem_log_every, stall_minutes=args.stall_minutes,
             )
 
             if STOP.is_set():
@@ -406,7 +705,14 @@ def run_experiment(name, cfg, args, port):
                 return True
 
             ran_for = time.time() - started
-            reason = "error in the script" if saw_error else f"exit code {returncode}"
+            if stalled_s is not None:
+                reason = f"stalled: no output for {stalled_s / 60:.1f} min"
+            elif mem_kill_gb is not None:
+                reason = f"memory guard at {mem_kill_gb:.1f} GB"
+            elif saw_error:
+                reason = "error in the script"
+            else:
+                reason = f"exit code {describe_exit(returncode)}"
             log(f"[{name}] stopped after {human(ran_for)} ({reason}); "
                 f"last checkpoint {done_after:,} steps; attempt {failures}/{args.max_retries}")
 
@@ -472,6 +778,17 @@ def build_parser():
                         help="Allow W&B online mode (default: offline, so it never prompts)")
     parser.add_argument("--quiet", action="store_true",
                         help="Do not mirror the training output to the console (it still goes to runner.log)")
+    parser.add_argument("--mem-limit-gb", type=float, default=14.0,
+                        help="Watchdog: kill an experiment whose private memory exceeds this and restart it "
+                             "from the latest checkpoint (default 14; 0 disables)")
+    parser.add_argument("--mem-hard-gb", type=float, default=16.0,
+                        help="OS-enforced cap on an experiment's committed memory via a Windows Job Object; "
+                             "allocations beyond it fail inside the experiment (default 16; 0 disables)")
+    parser.add_argument("--stall-minutes", type=float, default=15.0,
+                        help="Kill and restart an experiment that prints nothing for this long - a native "
+                             "CARLA hang (default 15; 0 disables)")
+    parser.add_argument("--mem-log-every", type=float, default=300.0,
+                        help="Seconds between memory readings in runner.log (default 300)")
     return parser
 
 
@@ -489,6 +806,19 @@ def main(argv=None):
     if args.port_step is None:
         args.port_step = 0 if args.parallel == 1 else 10
     args.echo = (not args.quiet) and args.parallel == 1
+
+    global RUNNER_LOG
+    log_root = Path(args.log_root).resolve() if args.log_root else (args.cwd / "logs")
+    log_root.mkdir(parents=True, exist_ok=True)
+    RUNNER_LOG = log_root / "train_all.log"
+    if args.mem_hard_gb > 0 and 0 < args.mem_hard_gb <= args.mem_limit_gb:
+        args.mem_limit_gb = 0.9 * args.mem_hard_gb   # the watchdog must fire before the OS cap
+    runner_job = None
+    if os.name == "nt":
+        try:   # every child (CARLA, experiments, taskkill) inherits this job and dies with the runner
+            runner_job = Job(_K32.GetCurrentProcess())
+        except OSError as exc:
+            log(f"WARNING could not create the runner's kill-on-close job: {exc}")
 
     names = args.only or [n for n, cfg in EXPERIMENTS.items() if not cfg.get("opt_in")]
 
@@ -522,6 +852,11 @@ def main(argv=None):
         log("CARLA is assumed to be running already (pass --carla-exe to let the runner manage it)")
     log(f"keeping the newest {args.keep_checkpoints} checkpoints per experiment"
         if args.keep_checkpoints else "checkpoint pruning is OFF")
+    if os.name == "nt" and (args.mem_limit_gb > 0 or args.mem_hard_gb > 0):
+        log(f"memory guard   : watchdog kill at {args.mem_limit_gb:g} GB, OS hard cap {args.mem_hard_gb:g} GB "
+            f"per experiment; children die with the runner ({'on' if runner_job else 'OFF'})")
+    else:
+        log("memory guard   : OFF")
     print(flush=True)
 
     results = {}
