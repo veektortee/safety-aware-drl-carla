@@ -39,7 +39,8 @@ from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import LogEveryNTimesteps
 from stable_baselines3.common.logger import configure
 
-from tests.pipeline_carla_test import CarlaGymEnv, CBFSafetyLayerWrapper, PolicyTrustScoreCallback
+from tests.pipeline_carla_test import (CarlaGymEnv, CBFSafetyLayerWrapper, PolicyTrustScoreCallback,
+                                       add_training_curriculum_args, training_curriculum_kwargs)
 from commons.metrics_callbacks import EpisodeMetricsCallback, EvalCallback, write_run_config
 from commons.stt import (CHANNELS, EMBED_DIM, GRID, NUM_FRAMES, SttNavObservationWrapper,
                          fit_stt_projection, projection_summary, stt_policy_kwargs)
@@ -64,7 +65,7 @@ N_CRITICS = 5
 DEFAULT_PORT = 2000
 TIME_LIMIT = 3000          # upper bound; the env derives a shorter per-route limit
 LEARNING_STARTS = 1000
-SAVE_FREQ = 25000
+SAVE_FREQ = 5000           # latest checkpoint every 5k steps: a crash loses at most ~6 min of training
 EVAL_FREQ = 25000
 EVAL_EPISODES = 10
 SB3_TABLE_EVERY = 1000     # steps between SB3 stdout tables (train/* losses)
@@ -73,7 +74,8 @@ PROJECTION_FIT_STEPS = 1000  # expert-driving frames (full-traffic stage) used t
 
 
 def create_stt_env(port: int = DEFAULT_PORT, render: bool = False, num_npc: int = 200,
-                   num_pedestrians: int = 200, curriculum_stage: int = 0):
+                   num_pedestrians: int = 200, curriculum_stage: int = 0,
+                   env_kwargs=None):
     """CarlaGymEnv -> CBFSafetyLayerWrapper -> SttNavObservationWrapper (needs a projection, see train())."""
     print(f"[ENV] Connecting to CARLA on port {port} (curriculum stage {curriculum_stage})...")
     env = CarlaGymEnv(
@@ -86,6 +88,7 @@ def create_stt_env(port: int = DEFAULT_PORT, render: bool = False, num_npc: int 
         num_pedestrians=num_pedestrians,
         show_sensor_data=render,                    # camera window
         curriculum_stage=curriculum_stage,
+        **(env_kwargs or {}),   # traffic fill / steering / overtaking (training curriculum)
     )
     env = CBFSafetyLayerWrapper(env)
     env = SttNavObservationWrapper(env, num_frames=NUM_FRAMES, channels=CHANNELS, occlusion=OCCLUSION)
@@ -128,8 +131,10 @@ def train(args) -> int:
         print(f"resume from {args.load_checkpoint}")
     print("=" * 80)
 
+    print(f"[CURRICULUM] traffic & driving: {training_curriculum_kwargs(args)}")
     env = create_stt_env(port=args.port, render=args.render, num_npc=args.num_npc,
-                         num_pedestrians=args.num_pedestrians, curriculum_stage=env_stage)
+                         num_pedestrians=args.num_pedestrians, curriculum_stage=env_stage,
+                         env_kwargs=training_curriculum_kwargs(args))
     try:
         policy_kwargs = stt_policy_kwargs(N_CRITICS)
         buffer_restored = False
@@ -198,6 +203,7 @@ def train(args) -> int:
             "curriculum": {"enabled": not args.no_curriculum, "start_stage": start_stage, "env_stage": env_stage},
             "num_npc": args.num_npc,
             "num_pedestrians": args.num_pedestrians,
+            "traffic_and_driving": training_curriculum_kwargs(args),
             "port": args.port,
             "render": args.render,
             "resumed_from": args.load_checkpoint,
@@ -274,6 +280,7 @@ def parse_args(argv=None):
     parser.add_argument("--load-checkpoint", type=str, default=None,
                         help="SAC .zip to resume from (frame projection and STT weights are inside it; the "
                              "replay buffer is restored if saved beside it)")
+    add_training_curriculum_args(parser)
     return parser.parse_args(argv)
 
 

@@ -38,7 +38,8 @@ from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import LogEveryNTimesteps
 from stable_baselines3.common.logger import configure
 
-from tests.pipeline_carla_test import CarlaGymEnv, CBFSafetyLayerWrapper, PolicyTrustScoreCallback
+from tests.pipeline_carla_test import (CarlaGymEnv, CBFSafetyLayerWrapper, PolicyTrustScoreCallback,
+                                       add_training_curriculum_args, training_curriculum_kwargs)
 from commons.metrics_callbacks import EpisodeMetricsCallback, EvalCallback, write_run_config
 from commons.obs_wrappers import CnnNavObservationWrapper
 from commons.resnet_extractor import (DEFAULT_TRAINABLE, TRAINABLE_CHOICES, extractor_mismatch,
@@ -63,7 +64,7 @@ POLICY = "MultiInputPolicy"
 N_CRITICS = 5
 TIME_LIMIT = 3000          # upper bound; the env derives a shorter per-route limit
 LEARNING_STARTS = 1000
-SAVE_FREQ = 25000
+SAVE_FREQ = 5000           # latest checkpoint every 5k steps: a crash loses at most ~6 min of training
 EVAL_FREQ = 25000
 EVAL_EPISODES = 10
 SB3_TABLE_EVERY = 1000     # steps between SB3 stdout tables (train/* losses)
@@ -71,7 +72,8 @@ OCCLUSION = "mixed"
 
 
 def create_cnn_env(port: int = 2000, render: bool = False, num_npc: int = 200,
-                   num_pedestrians: int = 200, curriculum_stage: int = 0):
+                   num_pedestrians: int = 200, curriculum_stage: int = 0,
+                   env_kwargs=None):
     """CarlaGymEnv -> CBFSafetyLayerWrapper -> CnnNavObservationWrapper."""
     print(f"[ENV] Connecting to CARLA on port {port} (curriculum stage {curriculum_stage})...")
     env = CarlaGymEnv(
@@ -84,6 +86,7 @@ def create_cnn_env(port: int = 2000, render: bool = False, num_npc: int = 200,
         num_pedestrians=num_pedestrians,
         show_sensor_data=render,                    # camera window
         curriculum_stage=curriculum_stage,
+        **(env_kwargs or {}),   # traffic fill / steering / overtaking (training curriculum)
     )
     env = CBFSafetyLayerWrapper(env)
     env = CnnNavObservationWrapper(env, size=84, occlusion=OCCLUSION)
@@ -139,8 +142,10 @@ def train(args) -> int:
         print(f"resume from {args.load_checkpoint}")
     print("=" * 80)
 
+    print(f"[CURRICULUM] traffic & driving: {training_curriculum_kwargs(args)}")
     env = create_cnn_env(port=args.port, render=args.render, num_npc=args.num_npc,
-                         num_pedestrians=args.num_pedestrians, curriculum_stage=env_stage)
+                         num_pedestrians=args.num_pedestrians, curriculum_stage=env_stage,
+                         env_kwargs=training_curriculum_kwargs(args))
     try:
         policy_kwargs = {
             "net_arch": {"pi": [256, 256], "qf": [256, 256]},
@@ -206,6 +211,7 @@ def train(args) -> int:
             "curriculum": {"enabled": not args.no_curriculum, "start_stage": start_stage, "env_stage": env_stage},
             "num_npc": args.num_npc,
             "num_pedestrians": args.num_pedestrians,
+            "traffic_and_driving": training_curriculum_kwargs(args),
             "port": args.port,
             "render": args.render,
             "resumed_from": args.load_checkpoint,
@@ -288,6 +294,7 @@ def parse_args(argv=None):
                         help=f"Train directly on the final stage ({FINAL_STAGE})")
     parser.add_argument("--load-checkpoint", type=str, default=None,
                         help="SAC .zip to resume from (replay buffer restored if saved beside it)")
+    add_training_curriculum_args(parser)
     args = parser.parse_args(argv)
     if args.log_dir is None:
         args.log_dir = f"./logs/{run_names(args)[0]}"
