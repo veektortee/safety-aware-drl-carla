@@ -78,7 +78,7 @@ Rates that only make sense over many episodes. (With `window=N` the namespace is
 | `reward/per_step` | reward/step | ↑ | `return_total` / episode length. |
 | `reward/share_progress` | 0–1 | — | \|Σ progress\| / Σ over groups of \|group sum\|. Route progress should dominate. |
 | `reward/share_time` | 0–1 | — | Same for the time cost. |
-| `reward/share_shaping` | 0–1 | — | Same for the driving penalties: `speeding`, `lateral`, `heading`, `illegal_lane`, `stop_sign`. |
+| `reward/share_shaping` | 0–1 | — | Same for the driving penalties: `speeding`, `lateral`, `heading`, `illegal_lane`, `stop_sign`, and with reward 3.1 also `steer_change` (penalty) and `overtake` (bonus). |
 | `reward/share_terminal` | 0–1 | — | Same for the terminal terms: `goal`, `collision`, `red_light`, `off_route`, `wrong_way`. |
 | `reward/share_cbf` | 0–1 | — | Same for the CBF intervention penalty (`cbf_penalty_sum`). |
 
@@ -99,7 +99,7 @@ The five shares sum to 1. A group near 1 dominates what the agent learns. Per-co
 
 | Tag | Unit | Dir. | How computed |
 |---|---|---|---|
-| `curriculum/stage` | stage | ↑ | Curriculum stage of the episode (0 = empty roads, short routes … 3 = full traffic). See `commons/curriculum_stages.py`. |
+| `curriculum/stage` | stage | ↑ | Curriculum stage of the episode (0 = empty roads, short routes … 5 = dense traffic). See `commons/curriculum_stages.py`. |
 | `perf/env_steps_per_s` | steps/s | ↑ | Training env steps per wall-clock second over the last 1,000 steps (evaluation time excluded). |
 | `perf/env_step_ms` | ms | ↓ | Mean time per env step spent in policy inference + CBF + CARLA tick + sensors. |
 | `perf/train_step_ms` | ms | ↓ | Mean time per env step spent in SAC gradient updates. |
@@ -168,11 +168,14 @@ episode (`spawn_index`, `end_reason`, `return_total`, `length_steps`, `distance_
 
 ### `run_config.json`
 
-Written at start: `reward_version` ("3.0"), git commit/branch/dirty, command line, library versions,
+Written at start: `reward_version` ("3.0", or "3.1" when the env's steering-change penalty or overtake
+bonus is on: the 5q CNN, 2q STT and 5q STT scripts since 2026-11-19), git commit/branch/dirty, command line, library versions,
 SAC hyperparameters, policy class and number of critics, observation/action spaces, the gym wrapper
 stack, env constants (the env's UPPER_CASE class attributes) and settings (NPC/pedestrian counts,
-time limit, curriculum stage), CBF wrapper/layer parameters, plus whatever the experiment passes in
-`extra`. On resume the previous version is appended to `run_config_history.jsonl`.
+time limit, curriculum stage, and the training-curriculum options `traffic_fill`, `steer_smoothing`,
+`steer_change_penalty`, `overtake_bonus`, `lead_corridor_follows_ego`), CBF wrapper/layer parameters,
+plus whatever the experiment passes in `extra` (the three scripts above add the same options as
+`traffic_and_driving`). On resume the previous version is appended to `run_config_history.jsonl`.
 
 ## Console
 
