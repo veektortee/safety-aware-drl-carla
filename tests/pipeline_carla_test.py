@@ -53,6 +53,7 @@ except ImportError:
 from models.pipeline import Pipeline
 from commons.vehicle_model import DT, B_MAX, BRAKE_DELAY_S, EGO_HALF_WIDTH, accel_to_pedals
 from commons.nav_layout import NAV_FEATURES, NAV_DIM
+from commons.overtake import CLEAR_AHEAD_M, CLEAR_BEHIND_M, OvertakeTracker, lane_clear
 from commons.curriculum_stages import STAGES
 from commons.debug import DEBUG, dprint
 from commons.navigation import GlobalRoutePlanner
@@ -135,6 +136,7 @@ REWARD_COMPONENT_KEYS = (
     "progress", "time", "speeding", "lateral", "heading",
     "illegal_lane", "stop_sign",
     "goal", "collision", "red_light", "off_route", "wrong_way",
+    "steer_change", "overtake",          # reward 3.1 terms; always 0.0 when the env options are off
 )
 
 TERMINAL_REASONS = ("endpoint", "collision", "collision_pedestrian", "red_light", "off_route", "wrong_way")
@@ -253,6 +255,21 @@ def pick_town_maps(available: Sequence[str]) -> List[str]:
     return [towns[t] for t in sorted(towns)]
 
 
+# Towns left out of maps="all" (training rotation, eval rounds, demo); an explicit maps=[...] still loads them.
+# Town01_Opt with S5 traffic (230 cars, ~250 walkers) failed inside CARLA's native client code (Traffic Manager
+# / walker navigation run in-process during world.tick()) in 7 of 8 reproductions on 2026-11-19, within 1-4
+# minutes: unbounded memory growth (75 GB in training on 2026-11-18) or an access violation, with hybrid
+# physics on or off, with or without walkers, at 140 or 230 cars, with or without a map switch (the 8th run
+# lasted 6.7 minutes without failing). Town10HD at S5 ran for hours.
+UNSTABLE_TOWNS = ("Town01",)
+
+
+def town_of(map_name: str) -> str:
+    """'Carla/Maps/Town01_Opt' -> 'Town01'."""
+    name = map_basename(map_name)
+    return name[:-4] if name.endswith("_Opt") else name
+
+
 def next_map(maps: Sequence[str], current: str) -> str:
     """The map after `current` in the rotation (the first one if `current` is not in it)."""
     names = [map_basename(m) for m in maps]
@@ -271,6 +288,75 @@ def vehicle_cap(n_spawn_points: int) -> int:
     """NPC vehicles a map can hold: its spawn points minus a reserve (>= 10, 10%) so the ego always
     finds a clear spawn point."""
     return max(0, int(n_spawn_points) - max(10, int(n_spawn_points) // 10))
+
+
+# Traffic fill: CarlaGymEnv(traffic_fill=f) never puts more than share f of a town's capacity on the road -
+# at most f * vehicle_cap(spawn points) NPC cars and f * the configured pedestrian maximum. The env default
+# stays 1.0 (the original curriculum, which the 2q_cnn run in progress on 2026-11-19 keeps). Experiments
+# started after it pass --traffic-fill, default TRAINING_TRAFFIC_FILL: at 100% (S5 filled every spawn point
+# but the reserve) towns jammed solid and cars piled onto each other, which taught the agents little.
+# Lower stages are unaffected while their counts are below the cap (S2 15/15, S3 60/60).
+TRAINING_TRAFFIC_FILL = 0.7
+
+
+def traffic_caps(n_spawn_points: int, max_pedestrians: int, fill: float = 1.0) -> Tuple[int, int]:
+    """(NPC cars, walkers) a town may hold at the given fill."""
+    return int(fill * vehicle_cap(n_spawn_points)), int(fill * max(0, int(max_pedestrians)))
+
+
+# The training curriculum used by the experiments started after 2026-11-19 (5q CNN, 2q STT, 5q STT): 70%
+# traffic, smooth steering (low-pass 0.6: per-step jitter -75%, time constant ~0.1 s; penalty
+# -0.5 * (command change)^2: a full left-right flip costs -2 on that step, steady driving ~0),
+# +5 per safe overtake (well below any crash penalty, C = 50..300) and the perception corridor on the ego.
+TRAINING_STEER_SMOOTHING = 0.6
+TRAINING_STEER_CHANGE_PENALTY = 0.5
+TRAINING_OVERTAKE_BONUS = 5.0
+
+
+def add_training_curriculum_args(parser):
+    """Add the --traffic-fill / --steer-smoothing / --steer-change-penalty / --overtake-bonus /
+    --route-corridor options; their defaults are the training curriculum above."""
+    group = parser.add_argument_group("traffic and driving quality (defaults: the 70% curriculum)")
+    group.add_argument("--traffic-fill", type=float, default=TRAINING_TRAFFIC_FILL,
+                       help=f"Share of each town's car capacity and of --num-pedestrians the curriculum may use "
+                            f"(default {TRAINING_TRAFFIC_FILL}; 1.0 = the original 100%% curriculum)")
+    group.add_argument("--steer-smoothing", type=float, default=TRAINING_STEER_SMOOTHING,
+                       help=f"Low-pass on the applied steering, 0 = off (default {TRAINING_STEER_SMOOTHING})")
+    group.add_argument("--steer-change-penalty", type=float, default=TRAINING_STEER_CHANGE_PENALTY,
+                       help=f"Reward -w * (steering command change)^2 per step, 0 = off "
+                            f"(default {TRAINING_STEER_CHANGE_PENALTY})")
+    group.add_argument("--overtake-bonus", type=float, default=TRAINING_OVERTAKE_BONUS,
+                       help=f"Reward per safe overtake of a slow/queued car, 0 = off (default {TRAINING_OVERTAKE_BONUS})")
+    group.add_argument("--route-corridor", action="store_true",
+                       help="Old perception: lead corridor on the route centre line instead of on the ego")
+    return group
+
+
+def training_curriculum_kwargs(args) -> Dict:
+    """CarlaGymEnv keyword arguments from the options added by add_training_curriculum_args."""
+    return dict(traffic_fill=float(args.traffic_fill), steer_smoothing=float(args.steer_smoothing),
+                steer_change_penalty=float(args.steer_change_penalty), overtake_bonus=float(args.overtake_bonus),
+                lead_corridor_follows_ego=not bool(args.route_corridor))
+
+
+# NPC physics guard. In dense traffic PhysX sometimes launches a car into the air or drops it through the
+# road (seen on Town01_Opt at S5: cars 40 m up, 60 m under the map, 56 m/s launches). Perception takes
+# lead vehicles from the actor list projected onto the route, so a car sunk under the road is a phantom
+# obstacle the CBF brakes for. The env destroys such cars right after the tick that shows them
+# (CarlaGymEnv._remove_broken_npcs) and replaces them at the next reset.
+NPC_MAX_SPEED_MPS = 40.0        # no NPC legitimately drives this fast on these towns (highways are 90 km/h)
+NPC_MAX_VERTICAL_MPS = 8.0      # launched or falling; driving over hills and kerbs stays well below
+NPC_Z_BELOW_ROADS_M = 6.0       # this far below the map's lowest road = fell through
+NPC_Z_ABOVE_ROADS_M = 8.0       # this far above the map's highest road = launched
+
+
+def npc_physics_broken(vx: float, vy: float, vz: float, z: float, road_z_min: float, road_z_max: float) -> bool:
+    """True for an NPC car the physics engine has launched, dropped through the road or sped up absurdly."""
+    speed_sq = vx * vx + vy * vy + vz * vz
+    if not math.isfinite(speed_sq) or not math.isfinite(z):
+        return True
+    return (speed_sq > NPC_MAX_SPEED_MPS ** 2 or abs(vz) > NPC_MAX_VERTICAL_MPS
+            or z < road_z_min - NPC_Z_BELOW_ROADS_M or z > road_z_max + NPC_Z_ABOVE_ROADS_M)
 
 
 def condition_flags(snap: dict, cfg=RewardConfigV3) -> Tuple[bool, bool, bool]:
@@ -317,6 +403,13 @@ def compute_reward_v3(snap: dict, prev: dict, cfg=RewardConfigV3):
     comps["illegal_lane"] = cfg.ILLEGAL_LANE_PENALTY * int(snap.get("n_illegal_invasions", 0))
     if snap.get("stop_violation", False):
         comps["stop_sign"] = cfg.STOP_SIGN_PENALTY
+
+    # reward 3.1 (env options; 0.0 when off): smooth steering and safe overtaking
+    w_steer = float(getattr(cfg, "steer_change_penalty", 0.0) or 0.0)
+    if w_steer > 0.0:
+        d_steer = float(snap.get("cmd_steer", 0.0)) - float(snap.get("prev_cmd_steer", 0.0))
+        comps["steer_change"] = -w_steer * d_steer * d_steer
+    comps["overtake"] = float(snap.get("overtake_bonus", 0.0))
 
     C = float(snap["crash_penalty"])
     # severity uses the pre-impact speed: the impact itself already slows the car on the event tick
@@ -434,6 +527,13 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
 
     EGO_BLUEPRINTS = ("vehicle.tesla.model3", "vehicle.audi.a2", "vehicle.dodge.charger", "vehicle.bmw.grandtourer")
     TM_PORT_OFFSET = 6000   # Traffic Manager port = CARLA port + 6000 (2000 -> 8000), so parallel runs don't collide
+    # Every map load gets a NEW Traffic Manager on the next port (8000, 8100, ... wrapping after 50), and the
+    # old one is shut down before load_world(). The Traffic Manager runs inside this process. On 2026-11-19
+    # one carried across the Town10HD -> Town01 switch launched or sank 6 cars in the first 7 s, and every
+    # run with such a switch ended in the memory runaway (see UNSTABLE_TOWNS); one created on the already
+    # loaded Town01 produced no launched or sunk car in 4 episodes.
+    TM_PORT_STRIDE = 100
+    TM_GENERATIONS = 50
     CAMERA_W = 640
     CAMERA_H = 360
     MAP_LOAD_TIMEOUT_S = 180.0
@@ -452,12 +552,31 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
         seed: Optional[int] = None,
         maps="all",
         map_rotate_every: int = 10,
+        traffic_fill: float = 1.0,
+        steer_smoothing: float = 0.0,
+        steer_change_penalty: float = 0.0,
+        overtake_bonus: float = 0.0,
+        lead_corridor_follows_ego: bool = False,
     ):
         """maps: 'all' = every installed town (one map per town, '_Opt' preferred), None = stay on the
         server's current map, or a list of map names. Training switches to the next map every
         `map_rotate_every` episodes; evaluation episodes pick their map with reset options
         {'map_slot': i, 'map_slots': n} (or {'map': name}). num_npc_vehicles / num_pedestrians cap
-        the curriculum stage's counts."""
+        the curriculum stage's counts; traffic_fill caps them further at that share of the town's car
+        capacity and of num_pedestrians (default 1.0 = no extra cap; the experiments pass
+        TRAINING_TRAFFIC_FILL = 0.7 through --traffic-fill).
+
+        Driving-quality options (all off by default = the behaviour the 2q_cnn run was trained with):
+          steer_smoothing k in [0, 1): applied steer = k * previous applied steer + (1 - k) * command
+              (a first-order low-pass; prev_steer in the observation is the applied value, so the
+              state stays Markov).
+          steer_change_penalty w: reward term -w * (command_t - command_{t-1})^2 on the steering
+              command the env receives, so the policy itself stops oscillating.
+          overtake_bonus B: +B once per vehicle passed after a safe-overtake opportunity (see
+              commons/overtake.py).
+          lead_corridor_follows_ego: centre the perception corridor (lead vehicle, LiDAR gap) on the
+              ego instead of the route centre line, so a lane change is seen correctly.
+        Any of steer_change_penalty / overtake_bonus changes the reward: REWARD_VERSION becomes "3.1"."""
         self.host = host
         self.port = port
         self.timeout = timeout
@@ -465,6 +584,15 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
         self.render_mode = render_mode
         self.num_npc_vehicles = int(num_npc_vehicles)
         self.num_pedestrians = int(num_pedestrians)
+        self.traffic_fill = float(np.clip(float(traffic_fill), 0.0, 1.0))
+        self.steer_smoothing = float(np.clip(float(steer_smoothing), 0.0, 0.95))
+        self.steer_change_penalty = max(0.0, float(steer_change_penalty))
+        self.overtake_bonus = max(0.0, float(overtake_bonus))
+        self.lead_corridor_follows_ego = bool(lead_corridor_follows_ego)
+        if self.steer_change_penalty > 0.0 or self.overtake_bonus > 0.0:
+            self.REWARD_VERSION = "3.1"      # instance override: v3 + steering-change / overtaking terms
+        self._overtake = OvertakeTracker(self.overtake_bonus)
+        self._prev_cmd_steer = 0.0
         self.show_sensor_data = bool(show_sensor_data)
         self.display_overlay = None     # optional fn(BGR copy) -> BGR image for the camera window (demo HUD)
         self._maps_request = maps
@@ -482,6 +610,7 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
         self.map = None
         self.blueprint_library = None
         self.traffic_manager = None
+        self._tm_generation = 0             # n-th Traffic Manager of this env (a new one per map load)
         self.spectator = None
 
         # Actors (NPC / walker lists hold actor ids)
@@ -505,6 +634,9 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
         self.lidar_transform = None     # sensor world transform of that sweep
         self._sensor_timeouts = 0
         self._frame = 0
+        self._road_z_range = (-1e9, 1e9)   # lowest / highest road of the loaded map (NPC physics guard)
+        self._npc_removed_on_map = 0
+        self._npc_removed_pending = 0       # removed by the guard, not yet replaced
 
         # Episode state
         self.route = None
@@ -556,6 +688,7 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
         if isinstance(maps, str) and maps.lower() == "all":
             listing = getattr(self.client, "get_available_maps", None)
             found = pick_town_maps(listing()) if callable(listing) else []
+            found = [m for m in found if town_of(m) not in UNSTABLE_TOWNS]
             return found or [self.current_map_name]
         names = [map_basename(m) for m in ([maps] if isinstance(maps, str) else maps)]
         return names or [self.current_map_name]
@@ -569,6 +702,10 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
         self._clear_map()
         self._spawn_points = list(self.map.get_spawn_points())
         self._spawn_xyz = np.array([[sp.location.x, sp.location.y, sp.location.z] for sp in self._spawn_points])
+        road_z = [wp.transform.location.z for wp in self.map.generate_waypoints(10.0)] or [0.0]
+        self._road_z_range = (float(min(road_z)), float(max(road_z)))
+        self._npc_removed_on_map = 0
+        self._npc_removed_pending = 0
         self._spawn_ego()
         self._attach_sensors()
         self._grp = GlobalRoutePlanner(self.map, self.ROUTE_SAMPLING_M)
@@ -610,9 +747,9 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
             settings.synchronous_mode = False
             settings.fixed_delta_seconds = None
             self.world.apply_settings(settings)
-            self.traffic_manager.set_synchronous_mode(False)
         except Exception:
             pass
+        self._retire_traffic_manager()   # never carry a Traffic Manager across load_world()
         self.client.set_timeout(self.MAP_LOAD_TIMEOUT_S)
         try:
             world = self.client.load_world(name)
@@ -628,7 +765,8 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
         self.map = self.world.get_map()
         self.blueprint_library = self.world.get_blueprint_library()
         self.spectator = self.world.get_spectator()
-        self._setup_world()
+        self._tm_generation = (self._tm_generation + 1) % self.TM_GENERATIONS
+        self._setup_world()              # a fresh Traffic Manager, built on the loaded map
         self.world.tick()
         for q in (self._q_rgb, self._q_lidar, self._q_collision, self._q_lane):   # frames of the old world
             while True:
@@ -670,9 +808,21 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
         self.spectator = self.world.get_spectator()
         print(f"[OK] Connected to CARLA ({self.map.name})")
 
+    def _retire_traffic_manager(self):
+        """Shut the current Traffic Manager down (its cars are already destroyed) so none survives a map load."""
+        tm, self.traffic_manager = self.traffic_manager, None
+        if tm is None:
+            return
+        try:
+            tm.set_synchronous_mode(False)
+            tm.shut_down()
+        except Exception as exc:  # noqa: BLE001 - a new one on a new port is created after the load anyway
+            print(f"[ENV] WARNING could not shut down the old Traffic Manager: {exc}")
+
     def _setup_world(self):
         # TM must be synchronous before the world is, or NPCs tick on a different clock.
-        self.traffic_manager = self.client.get_trafficmanager(self.port + self.TM_PORT_OFFSET)
+        tm_port = self.port + self.TM_PORT_OFFSET + self.TM_PORT_STRIDE * self._tm_generation
+        self.traffic_manager = self.client.get_trafficmanager(tm_port)
         self.traffic_manager.set_synchronous_mode(True)
         self.traffic_manager.set_global_distance_to_leading_vehicle(2.5)
         self.traffic_manager.set_hybrid_physics_mode(True)   # needs an actor with role_name 'hero'
@@ -774,9 +924,11 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
 
     # ------------------------------------------------------------- ticking
     def _tick(self) -> int:
-        """world.tick(), then wait for the frame-matched camera image and LiDAR sweep."""
+        """world.tick(), remove physics-broken NPC cars, then wait for the frame-matched camera image and
+        LiDAR sweep."""
         frame = self.world.tick()
         self._frame = frame
+        self._remove_broken_npcs()
         msg = wait_for_frame(self._q_rgb, frame, self.SENSOR_TIMEOUT_S)
         if msg is not None:
             self.rgb_data = msg[1]
@@ -788,6 +940,89 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
         else:
             self._on_sensor_timeout("lidar", frame)
         return frame
+
+    def _adjacent_lane_clear(self, actors, snap) -> bool:
+        """True if a same-direction Driving lane beside the ego may legally be entered here (lane marking)
+        and holds no vehicle from CLEAR_BEHIND_M behind to CLEAR_AHEAD_M ahead (commons/overtake.py)."""
+        ego = self.ego_vehicle
+        ego_loc = ego.get_location()
+        wp = self.map.get_waypoint(ego_loc, project_to_road=True, lane_type=carla.LaneType.Driving)
+        if wp is None or wp.is_junction:
+            return False
+        sides = []
+        if wp.lane_change in (carla.LaneChange.Left, carla.LaneChange.Both):
+            sides.append(wp.get_left_lane())
+        if wp.lane_change in (carla.LaneChange.Right, carla.LaneChange.Both):
+            sides.append(wp.get_right_lane())
+        sides = [w for w in sides
+                 if w is not None and w.lane_type == carla.LaneType.Driving and w.lane_id * wp.lane_id > 0]
+        if not sides:
+            return False
+        s_ego = float(snap["s"])
+        near = [a for a in actors.filter("vehicle.*")
+                if a.id != ego.id and a.get_location().distance(ego_loc) < CLEAR_AHEAD_M + 25.0]
+        vehicles = []
+        if near:
+            xy = np.array([[a.get_location().x, a.get_location().y] for a in near], dtype=float)
+            s_v, l_v = self.route.project_points(xy, s_ego - CLEAR_BEHIND_M - 10.0, s_ego + CLEAR_AHEAD_M + 10.0)
+            vehicles = [(float(s), float(l), float(a.bounding_box.extent.x)) for a, s, l in zip(near, s_v, l_v)]
+        for adj in sides:
+            loc = adj.transform.location
+            _, l_adj = self.route.project_points(np.array([[loc.x, loc.y]], dtype=float), s_ego - 5.0, s_ego + 5.0)
+            if lane_clear(vehicles, s_ego, float(l_adj[0]), 0.5 * float(adj.lane_width)):
+                return True
+        return False
+
+    def _overtake_step(self, snap, actors, n_illegal: int, crashed: bool) -> float:
+        """Safe-overtake bonus earned on this step (commons/overtake.OvertakeTracker); never raises."""
+        route = self.route
+
+        def lead_front_s(actor_id):
+            a = actors.find(int(actor_id))
+            if a is None:
+                return None
+            loc = a.get_location()
+            s, _ = route.project_points(np.array([[loc.x, loc.y]], dtype=float), snap["s"] - 60.0, snap["s"] + 60.0)
+            return float(s[0]) + float(a.bounding_box.extent.x)
+
+        try:
+            return self._overtake.update(snap, self._episode_step, n_illegal, crashed,
+                                         lambda: self._adjacent_lane_clear(actors, snap), lead_front_s)
+        except Exception as exc:  # noqa: BLE001 - a reward helper must never end the episode
+            if not getattr(self, "_overtake_warned", False):
+                print(f"[ENV] WARNING overtake check failed ({exc}); no bonus on such steps")
+                self._overtake_warned = True
+            return 0.0
+
+    def _remove_broken_npcs(self) -> int:
+        """Destroy NPC cars that the last tick shows launched, under the map or absurdly fast (see
+        npc_physics_broken), so they are no phantom obstacles and the Traffic Manager stops driving them.
+        Returns how many."""
+        if not self.npc_vehicles:
+            return 0
+        snapshot = self.world.get_snapshot()
+        z_min, z_max = self._road_z_range
+        broken = []
+        for vid in self.npc_vehicles:
+            actor = snapshot.find(vid)
+            if actor is None:
+                continue
+            v = actor.get_velocity()
+            if npc_physics_broken(v.x, v.y, v.z, actor.get_transform().location.z, z_min, z_max):
+                broken.append(vid)
+        if not broken:
+            return 0
+        try:
+            self.client.apply_batch_sync([carla.command.DestroyActor(i) for i in broken], False)
+        except Exception as exc:  # noqa: BLE001 - never let the guard end an episode
+            print(f"[ENV] WARNING could not destroy broken NPC cars {broken}: {exc}")
+        gone = set(broken)
+        self.npc_vehicles = [i for i in self.npc_vehicles if i not in gone]
+        self._npc_removed_on_map += len(broken)
+        self._npc_removed_pending += len(broken)   # replaced at the next reset
+        print(f"[ENV] removed {len(broken)} NPC car(s) with broken physics (launched, under the map or "
+              f"> {NPC_MAX_SPEED_MPS:.0f} m/s); {self._npc_removed_on_map} on {self.current_map_name} so far")
+        return len(broken)
 
     def _on_sensor_timeout(self, name: str, frame: int):
         self._sensor_timeouts += 1
@@ -805,17 +1040,25 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
 
     # ---------------------------------------------------------- population
     def _population_target(self, stage: int) -> Tuple[int, int]:
-        """Stage counts, capped by the constructor's maxima and (vehicles) by the map's spawn points."""
+        """Stage counts, capped by the constructor's maxima and by the traffic fill of the town
+        (TRAFFIC_FILL of its car capacity and of the pedestrian maximum)."""
         cfg = STAGES[stage]
         n_npc = self.num_npc_vehicles if cfg.get("num_npc") is None else min(int(cfg["num_npc"]), self.num_npc_vehicles)
         n_walk = (self.num_pedestrians if cfg.get("num_walkers") is None
                   else min(int(cfg["num_walkers"]), self.num_pedestrians))
-        return min(n_npc, vehicle_cap(len(self._spawn_points))), n_walk
+        car_cap, walker_cap = traffic_caps(len(self._spawn_points), self.num_pedestrians, self.traffic_fill)
+        return min(n_npc, car_cap), min(n_walk, walker_cap)
 
     def _apply_stage_population(self):
         """(Re)spawn NPC vehicles and walkers when the active stage needs different counts."""
         target = self._population_target(self._active_stage)
         if target == self._population_counts:
+            if self._npc_removed_pending > 0:   # replace the cars the physics guard removed
+                missing, before = self._npc_removed_pending, len(self.npc_vehicles)
+                self._npc_removed_pending = 0
+                self._spawn_npcs(missing)
+                print(f"[ENV] replaced {len(self.npc_vehicles) - before}/{missing} removed NPC cars "
+                      f"({len(self.npc_vehicles)}/{target[0]} vehicles)")
             return
         self._destroy_population()
         self._spawn_npcs(target[0])
@@ -907,6 +1150,7 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
             self.client.apply_batch_sync([carla.command.DestroyActor(i) for i in ids], True)
         self.npc_vehicles, self.walkers, self.walker_controllers = [], [], []
         self._population_counts = None
+        self._npc_removed_pending = 0
 
     # --------------------------------------------------------------- reset
     def _select_spawn(self, actors, spawn_index: Optional[int]) -> int:
@@ -983,6 +1227,8 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
         # Only now clear the per-episode state.
         self._episode_step = 0
         self._prev_action = np.zeros(2, dtype=np.float32)
+        self._prev_cmd_steer = 0.0
+        self._overtake.reset()
         self._proj_hint = None
         self._off_route_steps = 0
         self._wrong_way_steps = 0
@@ -1039,9 +1285,11 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
         self._proj_hint = proj.idx
         lane = route.lane_status(loc, yaw, self.map)
 
-        lead_actor = find_lead(actors, ego, route, proj)
+        offset = float(proj.e_y) if self.lead_corridor_follows_ego else 0.0   # corridor centre [m, + = right]
+        lead_actor = find_lead(actors, ego, route, proj, lateral_offset=offset)
         if self.lidar_points is not None and self.lidar_transform is not None:
-            static_gap = float(lidar_static_gap(self.lidar_points, self.lidar_transform, route, proj))
+            static_gap = float(lidar_static_gap(self.lidar_points, self.lidar_transform, route, proj,
+                                                lateral_offset=offset))
         else:
             static_gap = 100.0
         lead = combine(lead_actor, static_gap)
@@ -1135,12 +1383,15 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
         if self.route is None or self._snapshot is None:
             raise RuntimeError("CarlaGymEnv.step() called before reset()")
         a = np.asarray(action, dtype=np.float64).reshape(-1)
-        steer = float(np.clip(a[0], -1.0, 1.0))
+        cmd_steer = float(np.clip(a[0], -1.0, 1.0))
         accel = float(np.clip(a[1], -1.0, 1.0))
+        k = self.steer_smoothing          # 0.0 = off (applied steer = command)
+        steer = float(k * float(self._prev_action[0]) + (1.0 - k) * cmd_steer) if k > 0.0 else cmd_steer
         throttle, brake = accel_to_pedals(accel)
         self.ego_vehicle.apply_control(carla.VehicleControl(throttle=float(throttle), steer=steer,
                                                             brake=float(brake)))
         self._prev_action = np.array([steer, accel], dtype=np.float32)   # executed (post-CBF) action
+        prev_cmd_steer, self._prev_cmd_steer = self._prev_cmd_steer, cmd_steer
 
         prev = self._snapshot
         frame = self._tick()
@@ -1148,7 +1399,8 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
 
         collisions = drain_frame_events(self._q_collision, self._episode_start_frame, frame)
         invasions = drain_frame_events(self._q_lane, self._episode_start_frame, frame)
-        snap = self._build_snapshot(self.world.get_actors())   # the one get_actors() call of this tick
+        actors = self.world.get_actors()                       # the one get_actors() call of this tick
+        snap = self._build_snapshot(actors)
 
         n_illegal = sum(1 for ev in invasions if lane_invasion_is_illegal(ev[1], prev["_lane"], snap["_lane"]))
         collision_ped = any(str(ev[1]).startswith("walker") for ev in collisions)
@@ -1164,7 +1416,10 @@ class CarlaGymEnv(RewardConfigV3, gym.Env):
             blocked_steps=self._blocked_steps,
             episode_step=self._episode_step, episode_limit=self._episode_limit,
             crash_penalty=float(STAGES[self._active_stage]["crash_penalty"]),
+            cmd_steer=cmd_steer, prev_cmd_steer=prev_cmd_steer,
         )
+        if self.overtake_bonus > 0.0:
+            snap["overtake_bonus"] = self._overtake_step(snap, actors, n_illegal, bool(collisions))
 
         reward, comps, terminated, truncated, reason = compute_reward_v3(snap, prev, self)
         self._accumulate(snap, prev, reward, comps, collisions, collision_ped, len(invasions), n_illegal)

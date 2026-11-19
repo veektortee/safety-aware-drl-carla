@@ -1114,8 +1114,12 @@ def write_run_config(log_dir: str, model, extra: Optional[dict] = None) -> str:
             env_section.update(_scalar_attrs(w, (
                 "host", "port", "time_limit", "render_mode", "curriculum_stage", "num_npc_vehicles",
                 "num_pedestrians", "seed", "show_sensor_data", "fixed_delta_seconds")))
-            if isinstance(env_section["constants"].get("REWARD_VERSION"), str):
-                cfg["reward_version"] = env_section["constants"]["REWARD_VERSION"]
+            env_section.update(_scalar_attrs(w, (
+                "traffic_fill", "steer_smoothing", "steer_change_penalty", "overtake_bonus",
+                "lead_corridor_follows_ego")))
+            version = getattr(w, "REWARD_VERSION", env_section["constants"].get("REWARD_VERSION"))
+            if isinstance(version, str):      # the instance value: options can make it "3.1"
+                cfg["reward_version"] = version
     cfg["env"] = env_section
     cfg["cbf"] = cbf_section
     if extra:

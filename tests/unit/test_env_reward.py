@@ -547,7 +547,8 @@ class OfflineEnv(env_mod.CarlaGymEnv):
     def _connect_carla(self):
         self.world = FakeWorld(self)
         self.map = SimpleNamespace(get_spawn_points=lambda: [
-            carla.Transform(carla.Location(x=100.0 * i, y=0.0, z=0.3)) for i in range(6)])
+            carla.Transform(carla.Location(x=100.0 * i, y=0.0, z=0.3)) for i in range(6)],
+            generate_waypoints=lambda distance: [])     # road heights for the NPC physics guard
         self.client = SimpleNamespace(apply_batch_sync=lambda batch, tick=False: [])
         self.spectator = SimpleNamespace(set_transform=lambda tf: setattr(self, "_spectator_tf", tf))
 
@@ -676,7 +677,7 @@ def test_offline_env_goal_and_blocked():
 
 @_with_fakes
 def test_offline_env_curriculum_stage_change():
-    env = OfflineEnv(num_npc_vehicles=40, num_pedestrians=20, seed=3)
+    env = OfflineEnv(num_npc_vehicles=40, num_pedestrians=20, seed=3, traffic_fill=1.0)   # raw stage counts
     calls = []
     env._spawn_npcs = lambda n: calls.append(("npc", n))
     env._spawn_walkers = lambda n: calls.append(("walker", n))
@@ -701,6 +702,71 @@ def test_offline_env_curriculum_stage_change():
     _, r, term, _, info = env.step(np.array([0.0, 0.0], np.float32))
     assert term and info["terminated_reason"] == "collision_pedestrian"
     assert close(info["reward_components"]["collision"], -2.0 * STAGES[3]["crash_penalty"] * 0.5)
+
+
+@_with_fakes
+def test_offline_env_steering_smoothing_and_change_penalty():
+    plain = OfflineEnv(num_npc_vehicles=0, num_pedestrians=0, seed=6)
+    assert plain.REWARD_VERSION == "3.0" and plain.steer_smoothing == 0.0
+    plain.reset()
+    _, _, _, _, info = plain.step(np.array([0.6, 0.0], np.float32))
+    assert close(plain.world.ego.controls[-1].steer, 0.6), "off: the command is applied as is"
+    assert info["reward_components"]["steer_change"] == 0.0 and info["reward_components"]["overtake"] == 0.0
+
+    env = OfflineEnv(num_npc_vehicles=0, num_pedestrians=0, seed=6, steer_smoothing=0.6, steer_change_penalty=0.5)
+    assert env.REWARD_VERSION == "3.1", "a different reward must be recorded as such"
+    env.reset()
+    _, _, _, _, info = env.step(np.array([1.0, 0.0], np.float32))
+    assert close(env.world.ego.controls[-1].steer, 0.4), "0.6 * 0 + 0.4 * 1.0"
+    assert close(info["reward_components"]["steer_change"], -0.5 * 1.0 ** 2), "command jumped 0 -> 1"
+    _, _, _, _, info = env.step(np.array([-1.0, 0.0], np.float32))
+    assert close(env.world.ego.controls[-1].steer, 0.6 * 0.4 - 0.4), "filtered towards -1"
+    assert close(info["reward_components"]["steer_change"], -0.5 * 2.0 ** 2), "oscillation is expensive"
+    _, _, _, _, info = env.step(np.array([-1.0, 0.0], np.float32))
+    assert info["reward_components"]["steer_change"] == 0.0, "a steady command costs nothing"
+    assert close(sum(info["reward_components"].values()), info.get("reward", sum(info["reward_components"].values())))
+    env.reset()
+    assert env._prev_cmd_steer == 0.0 and np.allclose(env._prev_action, 0.0), "reset clears the filter state"
+
+
+@_with_fakes
+def test_offline_env_corridor_follows_ego_only_when_asked():
+    seen = []
+    saved = env_mod.find_lead
+    env_mod.find_lead = lambda actors, ego, route, proj, *a, **k: (seen.append(k.get("lateral_offset", 0.0))
+                                                                     or _none_lead())
+    try:
+        env = OfflineEnv(num_npc_vehicles=0, num_pedestrians=0, seed=7)
+        env.reset()
+        env.world.ego.y = 3.0                                    # drifted towards the next lane
+        env.step(np.array([0.0, 0.0], np.float32))
+        assert seen[-1] == 0.0, "default: corridor on the route centre line"
+        env = OfflineEnv(num_npc_vehicles=0, num_pedestrians=0, seed=7, lead_corridor_follows_ego=True)
+        env.reset()
+        env.world.ego.y = 3.0
+        env.step(np.array([0.0, 0.0], np.float32))
+        assert close(seen[-1], 3.0), "corridor centred on the ego (e_y)"
+    finally:
+        env_mod.find_lead = saved
+
+
+@_with_fakes
+def test_offline_env_traffic_fill_caps_the_curriculum_at_70_percent():
+    assert OfflineEnv(num_npc_vehicles=0, num_pedestrians=0, seed=5).traffic_fill == 1.0, "env default unchanged"
+    env = OfflineEnv(num_npc_vehicles=300, num_pedestrians=300, seed=5,
+                     traffic_fill=env_mod.TRAINING_TRAFFIC_FILL)       # what the experiments pass
+    assert env.traffic_fill == 0.7
+    original_cap = env_mod.vehicle_cap
+    env_mod.vehicle_cap = lambda n: 140                  # a Town10HD-sized map
+    try:
+        assert env._population_target(5) == (98, 210), "S5: 70% of 140 cars and of 300 walkers"
+        assert env._population_target(4) == (98, 150), "S4 cars capped, its 150 walkers are below 210"
+        assert env._population_target(3) == (60, 60) and env._population_target(2) == (15, 15)
+        assert env._population_target(0) == (0, 0)
+        full = OfflineEnv(num_npc_vehicles=300, num_pedestrians=300, seed=5, traffic_fill=1.0)
+        assert full._population_target(5) == (140, 300), "fill 1.0 = the old 100% curriculum"
+    finally:
+        env_mod.vehicle_cap = original_cap
 
 
 @_with_fakes

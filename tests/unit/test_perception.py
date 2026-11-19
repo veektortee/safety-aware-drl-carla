@@ -96,6 +96,30 @@ def test_find_lead_curved_corridor():
     assert abs(info.gap_m - (s_car - 2.3 - (30.0 + EGO_HALF_LENGTH))) < 0.6
 
 
+def test_find_lead_corridor_can_follow_the_ego_into_the_next_lane():
+    route = _route(straight_waypoints(200.0))
+    ego, proj = _ego_and_proj(route, 10.0, 3.5)                       # ego has moved one lane right
+    assert abs(proj.e_y - 3.5) < 1e-6
+    slow_in_route_lane = FakeActor(1, "vehicle.audi.a2", 30.0, 0.0)
+    ahead_in_ego_lane = FakeActor(2, "vehicle.audi.a2", 45.0, 3.5)
+    actors = [ego, slow_in_route_lane, ahead_in_ego_lane]
+    assert find_lead(actors, ego, route, proj).actor_id == 1, "default: corridor on the route centre line"
+    info = find_lead(actors, ego, route, proj, lateral_offset=proj.e_y)
+    assert info.actor_id == 2, "corridor on the ego: the car in its own lane is the lead"
+    assert find_lead([ego, slow_in_route_lane], ego, route, proj, lateral_offset=proj.e_y).kind == "none"
+
+
+def test_lidar_gap_corridor_can_follow_the_ego():
+    route = _route(straight_waypoints(200.0))
+    _, proj = _ego_and_proj(route, 10.0, 3.5)
+    tf = _sensor_tf(10.0, 3.5)
+    in_route_lane = np.array([[20.0, -3.5, -1.0]])                    # sensor frame: 3.5 m to the left
+    in_ego_lane = np.array([[25.0, 0.0, -1.0]])
+    both = np.vstack([in_route_lane, in_ego_lane])
+    assert abs(lidar_static_gap(both, tf, route, proj) - (30.0 - 12.4)) < 1e-6, "default: route lane"
+    assert abs(lidar_static_gap(both, tf, route, proj, lateral_offset=proj.e_y) - (35.0 - 12.4)) < 1e-6
+
+
 def test_lidar_gap_basic_filters():
     route = _route(straight_waypoints(200.0))
     _, proj = _ego_and_proj(route, 10.0, 0.0)

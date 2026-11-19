@@ -74,8 +74,13 @@ def _strip_s_range(hull: np.ndarray, w: float):
     return min(cands), max(cands)
 
 
-def find_lead(actors, ego, route, proj, horizon_m=50.0, corridor_half_width=None) -> LeadInfo:
+def find_lead(actors, ego, route, proj, horizon_m=50.0, corridor_half_width=None,
+              lateral_offset=0.0) -> LeadInfo:
     """Nearest vehicle / pedestrian in the route corridor ahead of the ego.
+
+    lateral_offset [m, + = right]: centre of the corridor relative to the route centre line. 0.0 keeps
+    the corridor on the route; passing proj.e_y centres it on the ego, so after a lane change the car
+    in the ego's new lane is the lead and the one in the route lane is not (needed for overtaking).
 
     actors: a world.get_actors() snapshot (only vehicle.* and walker.pedestrian.* are used; the
     ego is skipped by id). Each actor's bounding box (bounding_box.get_world_vertices) is projected
@@ -114,6 +119,7 @@ def find_lead(actors, ego, route, proj, horizon_m=50.0, corridor_half_width=None
         return _no_lead()
     # cheap pre-filter on the actor centres (boxes are < 7 m half length, walker sweep < 6 m)
     _, l_c = route.project_points(np.array([[tf.location.x, tf.location.y] for _, _, tf in near]), s_from, s_to)
+    l_c = l_c - float(lateral_offset)
     cands = []
     for (a, kind, tf), lc in zip(near, l_c):
         if abs(lc) > w + 12.0:
@@ -125,6 +131,7 @@ def find_lead(actors, ego, route, proj, horizon_m=50.0, corridor_half_width=None
 
     all_xy = np.concatenate([c[2] for c in cands], axis=0)
     s_all, l_all = route.project_points(all_xy, s_from, s_to)
+    l_all = l_all - float(lateral_offset)
 
     best = _no_lead()
     start = 0
@@ -155,8 +162,9 @@ def find_lead(actors, ego, route, proj, horizon_m=50.0, corridor_half_width=None
 
 
 def lidar_static_gap(points_sensor, sensor_transform, route, proj, horizon_m=40.0,
-                     ground_z_cut=-1.3, ceiling_z=LIDAR_CEILING_Z) -> float:
-    """Gap [m] from the ego front bumper to the nearest LiDAR return inside the curved route corridor.
+                     ground_z_cut=-1.3, ceiling_z=LIDAR_CEILING_Z, lateral_offset=0.0) -> float:
+    """Gap [m] from the ego front bumper to the nearest LiDAR return inside the curved route corridor
+    (centred lateral_offset [m, + = right] from the route centre line, as in find_lead).
 
     points_sensor: (N, 3) or (N, 4) LiDAR points in the sensor frame (x forward, y right, z up;
     (3, N) / (4, N) is accepted too). Returns with z <= ground_z_cut or z >= ceiling_z (sensor
@@ -185,6 +193,7 @@ def lidar_static_gap(points_sensor, sensor_transform, route, proj, horizon_m=40.
     s_ego = float(proj.s)
     front = s_ego + EGO_HALF_LENGTH
     s, l = route.project_points(W[:, :2], s_ego - 1.0, front + horizon_m + 2.0)
+    l = l - float(lateral_offset)
     sel = (np.abs(l) < EGO_HALF_WIDTH + LIDAR_CORRIDOR_MARGIN) & (s > s_ego) & (s - front < horizon_m)
     if not np.any(sel):
         return NO_GAP

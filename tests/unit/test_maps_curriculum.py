@@ -213,6 +213,79 @@ def test_checkpoint_rings_count_the_finish_gate():
     assert rings.collected == 1, "only a finished route collects the remaining gates"
 
 
+# --------------------------------------------------------------------------------------------------
+# NPC physics guard (Traffic Manager memory runaway on dense Town01)
+# --------------------------------------------------------------------------------------------------
+
+def test_traffic_caps_are_70_percent_of_each_town():
+    from tests.pipeline_carla_test import TRAINING_TRAFFIC_FILL as FILL, traffic_caps
+
+    assert FILL == 0.7
+    spawn_points = {"Town02": 101, "Town03": 265, "Town04": 372, "Town05": 302, "Town10HD": 155}
+    cars = {t: traffic_caps(n, 300, FILL)[0] for t, n in spawn_points.items()}
+    assert cars == {"Town02": 63, "Town03": 167, "Town04": 234, "Town05": 190, "Town10HD": 98}, cars
+    assert traffic_caps(155, 300, FILL)[1] == 210, "70% of the 300-pedestrian maximum"
+    assert traffic_caps(155, 300) == (140, 300), "default fill 1.0 = the original 100% curriculum"
+
+
+def test_all_maps_leaves_out_unstable_towns_but_explicit_lists_keep_them():
+    from types import SimpleNamespace
+    from tests.pipeline_carla_test import CarlaGymEnv, UNSTABLE_TOWNS, town_of
+
+    assert "Town01" in UNSTABLE_TOWNS and town_of("Carla/Maps/Town01_Opt") == "Town01"
+    assert town_of("Town10HD_Opt") == "Town10HD"
+    env = CarlaGymEnv.__new__(CarlaGymEnv)
+    env.client = SimpleNamespace(get_available_maps=lambda: [
+        "/Game/Carla/Maps/Town01_Opt", "/Game/Carla/Maps/Town01", "/Game/Carla/Maps/Town02_Opt",
+        "/Game/Carla/Maps/Town10HD_Opt"])
+    env.map = SimpleNamespace(name="Carla/Maps/Town10HD_Opt")
+    assert env._resolve_maps("all") == ["Town02_Opt", "Town10HD_Opt"], "rotation and eval skip Town01"
+    assert env._resolve_maps(["Town01_Opt"]) == ["Town01_Opt"], "an explicit map list is honoured"
+
+
+def test_npc_physics_guard_flags_launched_sunk_and_absurdly_fast_cars():
+    from tests.pipeline_carla_test import npc_physics_broken
+
+    flat = (0.0, 0.5)   # Town01-like road heights
+    assert not npc_physics_broken(8.0, 0.0, 0.0, 0.3, *flat), "normal driving"
+    assert not npc_physics_broken(20.0, 10.0, 2.5, 0.3, *flat), "fast car over a crest"
+    assert npc_physics_broken(7.7, 0.0, 0.0, -61.0, *flat), "under the map (seen on Town01 at z = -61)"
+    assert npc_physics_broken(1.0, 0.0, 0.0, 41.0, *flat), "launched 40 m up (seen on Town01)"
+    assert npc_physics_broken(5.0, 0.0, -12.0, 2.0, *flat), "falling"
+    assert npc_physics_broken(56.0, 0.0, 0.0, 0.3, *flat), "56 m/s launch (seen on Town01)"
+    assert npc_physics_broken(float("nan"), 0.0, 0.0, 0.3, *flat), "NaN velocity"
+    assert npc_physics_broken(1.0, 0.0, 0.0, float("inf"), *flat), "non-finite position"
+    hilly = (-5.0, 30.0)
+    assert not npc_physics_broken(10.0, 0.0, 1.0, 29.0, *hilly), "on the highest road of a hilly town"
+    assert not npc_physics_broken(10.0, 0.0, -1.0, -6.0, *hilly), "on the lowest road of a hilly town"
+
+
+def test_env_destroys_only_broken_npcs_after_a_tick():
+    from types import SimpleNamespace
+    from tests.pipeline_carla_test import CarlaGymEnv
+
+    def actor(v, z):
+        return SimpleNamespace(get_velocity=lambda: SimpleNamespace(x=v[0], y=v[1], z=v[2]),
+                               get_transform=lambda: SimpleNamespace(location=SimpleNamespace(z=z)))
+
+    state = {1: actor((8, 0, 0), 0.3), 2: actor((7.7, 0, 0), -61.0), 3: actor((0, 0, 0), 0.2),
+             4: actor((56, 0, 0), 0.3)}   # 5: already gone (None)
+    destroyed = []
+    env = CarlaGymEnv.__new__(CarlaGymEnv)      # no CARLA: only the attributes the guard uses
+    env.npc_vehicles = [1, 2, 3, 4, 5]
+    env.world = SimpleNamespace(get_snapshot=lambda: SimpleNamespace(find=lambda i: state.get(i)))
+    env.client = SimpleNamespace(apply_batch_sync=lambda cmds, tick: destroyed.extend(c.actor_id for c in cmds))
+    env.map = SimpleNamespace(name="Carla/Maps/Town01_Opt")
+    env._road_z_range = (0.0, 0.5)
+    env._npc_removed_on_map = env._npc_removed_pending = 0
+
+    assert env._remove_broken_npcs() == 2
+    assert sorted(destroyed) == [2, 4], destroyed
+    assert env.npc_vehicles == [1, 3, 5] and env._npc_removed_on_map == 2
+    assert env._npc_removed_pending == 2, "replaced at the next reset"
+    assert env._remove_broken_npcs() == 0, "nothing left to remove"
+
+
 if __name__ == "__main__":
     import traceback
 
